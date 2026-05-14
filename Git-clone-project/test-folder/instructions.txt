@@ -1,0 +1,416 @@
+================================================================================
+  GIT-CLONE PROJECT — BUG & INCORRECTLY IMPLEMENTED FUNCTIONALITY REPORT
+================================================================================
+  Total issues found: 15
+  Critical: 3  |  High: 4  |  Medium: 5  |  Low: 3
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  CRITICAL — SECURITY & DATA INTEGRITY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[C-1] Password hashed with plain SHA-256 + custom salt — no key-stretching
+  File:    User.cs → HashPassword()
+  Problem: SHA-256 is a fast hash that can be brute-forced at billions of
+           guesses per second. Passwords must use a slow, purpose-built KDF
+           such as BCrypt, PBKDF2, or Argon2.
+
+  CURRENT (wrong):
+    var combined = password + salt;
+    var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(combined));
+
+  FIX — use PBKDF2 via ASP.NET Core's built-in helper:
+    using Microsoft.AspNetCore.Cryptography.KeyDerivation;
+
+    var hash = KeyDerivation.Pbkdf2(
+        password:       password,
+        salt:           Convert.FromBase64String(salt),
+        prf:            KeyDerivationPrf.HMACSHA256,
+        iterationCount: 310_000,
+        numBytesRequested: 32);
+    return Convert.ToBase64String(hash);
+
+────────────────────────────────────────────────────────────────────────────────
+
+[C-2] Default admin password "admin123" hard-coded in source
+  File:    AuthService.cs → LoadUsers()
+  Problem: Anyone who reads the source code knows the default admin credentials.
+           On first run, the admin password should be set interactively instead
+           of seeding a well-known one.
+
+  CURRENT (wrong):
+    admin.SetPassword("admin123");
+
+  FIX — prompt interactively on first run:
+    Console.Write("Set initial admin password: ");
+    var pw = ReadPassword();   // reuse ReadPassword() from Program.cs
+    admin.SetPassword(pw);
+
+────────────────────────────────────────────────────────────────────────────────
+
+[C-3] Commit timestamp is not included in the hash — commits are forgeable
+  File:    Commit.cs → GetContentBytes() and Commit constructor
+  Problem: The Timestamp field is set to DateTime.UtcNow in the default
+           constructor, and GetContentBytes() is called during ComputeHash()
+           in the parameterised constructor. While the ordering is technically
+           correct today, Timestamp is never passed as an explicit argument,
+           so two identical commits made at different times can produce the
+           same hash. Additionally, if Timestamp is not round-tripped correctly
+           through serialization/deserialization, rehashing for verification
+           will not match.
+
+  FIX — accept timestamp as an explicit constructor parameter:
+    public Commit(string treeHash, string? parentHash,
+                  string author, string message,
+                  DateTime? timestamp = null) : this()
+    {
+        TreeHash  = treeHash;
+        ParentHash = parentHash;
+        Author    = author;
+        Message   = message;
+        Timestamp = timestamp ?? DateTime.UtcNow;
+        Hash      = ComputeHash();
+    }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  HIGH — CORRECTNESS & DATA LOSS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[H-1] Checkout does not restore working directory files
+  File:    GitRepository.cs → Checkout()
+  Problem: Checkout() updates HEAD but never writes the target commit's tree
+           contents back to disk. The working directory stays unchanged —
+           switching branches has no visible effect on actual files.
+
+  CURRENT (wrong):
+    _referenceManager.SetHead(branchRef);
+    Console.WriteLine($"Switched to branch {branchName}");
+    return true;
+
+  FIX — restore tree contents after updating HEAD:
+    _referenceManager.SetHead(branchRef);
+    var commitHash = _referenceManager.GetCurrentCommit();
+    var commit = await _objectStore.GetObjectAsync(commitHash) as Commit;
+    if (commit != null)
+        await RestoreTreeAsync(commit.TreeHash, _workingDirectory);
+    return true;
+
+    // Add this helper method to GitRepository:
+    private async Task RestoreTreeAsync(string treeHash, string dir)
+    {
+        var tree = await _objectStore.GetObjectAsync(treeHash) as Tree;
+        if (tree == null) return;
+        foreach (var entry in tree.Entries)
+        {
+            if (entry.Type == "blob")
+            {
+                var blob = await _objectStore.GetObjectAsync(entry.Hash) as Blob;
+                if (blob != null)
+                    await File.WriteAllBytesAsync(
+                        Path.Combine(dir, entry.Name), blob.Data);
+            }
+            else if (entry.Type == "tree")
+            {
+                var subDir = Path.Combine(dir, entry.Name);
+                Directory.CreateDirectory(subDir);
+                await RestoreTreeAsync(entry.Hash, subDir);
+            }
+        }
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[H-2] Branch listing only shows the current branch
+  File:    Program.cs → HandleBranch()  |  GitRepository.cs
+  Problem: Running "branch" with no arguments only prints the current branch.
+           All other branches stored under refs/heads/ are ignored. There is
+           no public method on GitRepository to enumerate all branches.
+
+  FIX — add GetAllBranches() to GitRepository and use it in HandleBranch():
+    // GitRepository.cs
+    public List<string> GetAllBranches()
+        => _referenceManager.GetAllReferences()
+            .Where(r => r.Key.StartsWith("refs/heads/"))
+            .Select(r => r.Key[11..])
+            .ToList();
+
+    // Program.cs → HandleBranch()
+    var branches = _repository.GetAllBranches();
+    var current  = _repository.GetCurrentBranch();
+    foreach (var b in branches)
+        Console.WriteLine(b == current ? $"* {b}" : $"  {b}");
+
+────────────────────────────────────────────────────────────────────────────────
+
+[H-3] Entire input line is lowercased — commit messages and filenames corrupted
+  File:    Program.cs → RunInteractiveShell()
+  Problem: The full input string is lowercased before splitting, so the args
+           array (file paths, commit messages, usernames) also becomes
+           lower-case. Any mixed-case input is silently mangled.
+
+  CURRENT (wrong):
+    var input = Console.ReadLine()?.Trim().ToLower() ?? "";
+    var parts  = input.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var command = parts[0];
+    var args    = parts.Skip(1).ToArray();  // args are all lower-cased!
+
+  FIX — only lowercase the command token:
+    var rawInput = Console.ReadLine()?.Trim() ?? "";
+    var parts    = rawInput.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+    var command  = parts[0].ToLower();
+    var args     = parts.Skip(1).ToArray();  // original casing preserved
+
+────────────────────────────────────────────────────────────────────────────────
+
+[H-4] Session token is created but never used for authorization (dead code)
+  File:    GitRepository.cs → CreateSession() / ValidateSession()
+  Problem: CreateSession() and ValidateSession() are publicly exposed and
+           SessionManager is fully implemented, but CheckAuthorization() only
+           calls IsAuthenticated() which checks the in-memory _currentUser.
+           The session token is never validated on any protected operation,
+           making the entire session layer dead code.
+
+  FIX — either wire token validation into CheckAuthorization(), or remove the
+        session API if it is not needed for the current scope:
+
+    // Option A: store the token on login and validate it in CheckAuthorization
+    private string? _activeToken;
+
+    public bool Login(string username, string password)
+    {
+        var ok = _authService.Login(username, password);
+        if (ok) _activeToken = _sessionManager.CreateSession(username);
+        return ok;
+    }
+
+    private void CheckAuthorization(Permission required)
+    {
+        if (_activeToken == null || !_sessionManager.ValidateSession(_activeToken))
+            throw new UnauthorizedAccessException("Session invalid or expired");
+        if (!HasRepositoryAccess(required))
+            throw new UnauthorizedAccessException($"Insufficient permissions: {required}");
+    }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  MEDIUM — LOGIC ERRORS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[M-1] VerifyCommit() recurses through all ancestors — stack overflow on long histories
+  File:    VerificationService.cs → VerifyCommit() and VerifyCommitAsync()
+  Problem: Each call recurses into the parent commit. On a repository with
+           hundreds of commits this will throw a StackOverflowException.
+
+  FIX — replace recursion with an iterative loop:
+    public bool VerifyCommit(string commitHash)
+    {
+        var hash = commitHash;
+        while (!string.IsNullOrEmpty(hash))
+        {
+            var commit = objectStore.GetObject(hash) as Commit;
+            if (commit == null) return false;
+            if (!VerifyObject(hash)) return false;
+            if (!VerifyTree(commit.TreeHash)) return false;
+            hash = commit.ParentHash;
+        }
+        return true;
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[M-2] CommitFilesAsync drops all previously tracked files
+  File:    GitRepository.cs → CommitFilesAsync()
+           TreeBuilder.cs  → CreateTreeFromSpecificFilesAsync()
+  Problem: When committing specific files, CreateTreeFromSpecificFilesAsync()
+           builds a completely new tree from only those files. All other
+           previously-tracked files vanish from the new commit's tree, causing
+           data loss on the next checkout or diff.
+
+  FIX — start from the previous tree and patch in only the specified entries:
+    // In TreeBuilder.cs, add an overload that accepts the base tree:
+    public async Task<Tree> CreateTreeFromSpecificFilesAsync(
+        string workingDirectory,
+        Tree? baseTree,
+        params string[] filePaths)
+    {
+        // Start with entries from the base tree (previously tracked files)
+        var entries = baseTree?.Entries.ToList() ?? new List<TreeEntry>();
+
+        foreach (var filePath in filePaths)
+        {
+            var fullPath = Path.IsPathRooted(filePath)
+                ? filePath : Path.Combine(workingDirectory, filePath);
+            if (!File.Exists(fullPath)) continue;
+
+            var content = await File.ReadAllBytesAsync(fullPath);
+            var blob    = new Blob(content);
+            await _objectStore.StoreObjectAsync(blob);
+
+            // Replace or add the entry for this file
+            entries.RemoveAll(e => e.Name == Path.GetFileName(fullPath));
+            entries.Add(new TreeEntry {
+                Mode = "100644",
+                Name = Path.GetFileName(fullPath),
+                Hash = blob.Hash,
+                Type = "blob"
+            });
+        }
+
+        var tree = new Tree();
+        foreach (var entry in entries.OrderBy(e => e.Name))
+            tree.Entries.Add(entry);
+        tree.Hash = tree.ComputeHash();
+        return tree;
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[M-3] DeleteBranch does not check whether the branch is currently checked out
+  File:    GitRepository.cs → DeleteBranch()
+  Problem: If a user deletes the currently active branch (other than "main"),
+           HEAD points to a non-existent ref and every subsequent operation
+           that reads the current commit will silently return null.
+
+  FIX — add a guard before deletion:
+    if (branchName == GetCurrentBranch())
+    {
+        Console.WriteLine("Cannot delete the currently checked-out branch.");
+        return false;
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[M-4] GetStatusAsync double-counts files — untracked list includes tracked files
+  File:    GitRepository.cs → GetStatusAsync()
+  Problem: After computing the diff, the code collects all working-directory
+           files and subtracts only Modified and Added to find Untracked.
+           It never subtracts unchanged tracked files, so every file that has
+           not changed also appears in the Untracked list.
+
+  FIX — derive the tracked set from the previous commit's tree, not the diff:
+    // Build the full set of paths present in the committed tree
+    var trackedPaths = new HashSet<string>();
+    if (currentTree != null)
+        CollectTreePaths(currentTree, "", trackedPaths);
+
+    status.Untracked = allFiles
+        .Where(f => !trackedPaths.Contains(f) && !status.Added.Contains(f))
+        .ToList();
+
+    // Helper:
+    private void CollectTreePaths(Tree tree, string prefix,
+                                  HashSet<string> paths)
+    {
+        foreach (var entry in tree.Entries)
+        {
+            if (entry.Type == "blob")
+                paths.Add(prefix + entry.Name);
+            else if (entry.Type == "tree")
+            {
+                var sub = _objectStore.GetObject(entry.Hash) as Tree;
+                if (sub != null)
+                    CollectTreePaths(sub, prefix + entry.Name + "/", paths);
+            }
+        }
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[M-5] Tree.AddEntry() recomputes the hash on every call — O(n²) and redundant
+  File:    Tree.cs → AddEntry()
+  Problem: Each call to AddEntry() re-hashes the full entry list. TreeBuilder
+           already calls tree.Hash = tree.ComputeHash() after all entries are
+           added, making the per-call hash both wasteful and potentially wrong
+           if an intermediate (partial) hash gets cached.
+
+  FIX — remove Hash = ComputeHash() from AddEntry(); let callers compute the
+        final hash once after all entries have been added:
+
+    public void AddEntry(string mode, string name, string hash, string type)
+    {
+        Entries.Add(new TreeEntry {
+            Mode = mode, Name = name, Hash = hash, Type = type
+        });
+        // Do NOT recompute Hash here — caller does it once at the end
+    }
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  LOW — MINOR ISSUES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+[L-1] Logout does not invalidate the active session token
+  File:    AuthService.cs → Logout()  |  SessionManager.cs
+  Problem: Logout() sets _currentUser to null but does not call
+           DestroySession() on the active token. A stolen token stays valid
+           for up to 8 hours after the user logs out.
+
+  FIX — destroy the session on logout (requires storing the active token,
+        see H-4 fix above):
+    public void Logout()
+    {
+        if (_activeToken != null)
+            _sessionManager.DestroySession(_activeToken);
+        _activeToken  = null;
+        _currentUser  = null;   // via AuthService
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[L-2] GetCurrentBranch() crashes with IndexOutOfRangeException in detached HEAD state
+  File:    GitRepository.cs → GetCurrentBranch()
+  Problem: The slice [11..] assumes HEAD always starts with "refs/heads/"
+           (11 characters). In detached HEAD state this is false and throws.
+
+  CURRENT (wrong):
+    public string? GetCurrentBranch()
+        => _referenceManager.GetHead()?[11..];
+
+  FIX:
+    public string? GetCurrentBranch()
+    {
+        var head = _referenceManager.GetHead();
+        return head?.StartsWith("refs/heads/") == true ? head[11..] : null;
+    }
+
+────────────────────────────────────────────────────────────────────────────────
+
+[L-3] Excessive Console.WriteLine calls leak internal state to the user
+  File:    ObjectStore.cs, ReferenceManager.cs, GitRepository.cs (many places)
+  Problem: Every store, load, and cache hit prints internal hashes, file
+           paths, and serialized JSON to stdout. This clutters the user-facing
+           output and exposes implementation details.
+
+  FIX — replace with a proper ILogger<T> from Microsoft.Extensions.Logging,
+        or at minimum guard with a debug flag:
+
+    #if DEBUG
+    Console.WriteLine($"Stored object: {obj.Type} - {obj.Hash}");
+    #endif
+
+
+================================================================================
+  SUMMARY TABLE
+================================================================================
+
+  ID    Severity  File(s)                          Issue
+  ----  --------  -------------------------------- ----------------------------
+  C-1   Critical  User.cs                          Weak password hashing (SHA-256)
+  C-2   Critical  AuthService.cs                   Hard-coded admin password
+  C-3   Critical  Commit.cs                        Timestamp not stable for hashing
+  H-1   High      GitRepository.cs                 Checkout doesn't restore files
+  H-2   High      GitRepository.cs, Program.cs     Branch list incomplete
+  H-3   High      Program.cs                       Input lowercasing corrupts args
+  H-4   High      GitRepository.cs, SessionMgr.cs  Session tokens never validated
+  M-1   Medium    VerificationService.cs            Recursive verify → stack overflow
+  M-2   Medium    GitRepository.cs, TreeBuilder.cs  Partial commit drops tracked files
+  M-3   Medium    GitRepository.cs                 Delete active branch breaks HEAD
+  M-4   Medium    GitRepository.cs                 Untracked list double-counts files
+  M-5   Medium    Tree.cs                          AddEntry() recomputes hash O(n²)
+  L-1   Low       AuthService.cs, SessionMgr.cs    Logout doesn't invalidate token
+  L-2   Low       GitRepository.cs                 Detached HEAD crashes GetCurrentBranch
+  L-3   Low       ObjectStore.cs, ReferenceManager  Verbose debug output in production
+
+================================================================================
