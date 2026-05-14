@@ -14,6 +14,7 @@ public sealed class Commit : GitObject
     {
         Type = "commit";
         Timestamp = DateTime.UtcNow;
+        Hash = ComputeHash();
     }
 
     public Commit(string treeHash, string? parentHash, string author, string message, DateTime? timestamp = null) : this()

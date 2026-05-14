@@ -52,6 +52,12 @@ public sealed class ObjectStore : IAsyncDisposable
 
     public void StoreObject(GitObject obj)
     {
+        if (string.IsNullOrEmpty(obj.Hash) || obj.Hash == "empty" || obj.Hash == "error")
+        {
+            Console.WriteLine($"Warning: Not storing object with invalid hash: {obj.Hash}");
+            return;
+        }
+
         if (_cache.ContainsKey(obj.Hash))
             return;
 
@@ -90,14 +96,24 @@ public sealed class ObjectStore : IAsyncDisposable
         // Force all cached objects to be written to disk
         foreach (var obj in _cache)
         {
+            if (string.IsNullOrEmpty(obj.Key) || obj.Key == "empty" || obj.Key == "error")
+                continue;
+
             var objDir = Path.Combine(_objectsPath, obj.Key[..2]);
             var objFile = Path.Combine(objDir, obj.Key[2..]);
 
             if (!File.Exists(objFile))
             {
-                var data = SerializeObject(obj.Value);
-                Directory.CreateDirectory(objDir);
-                File.WriteAllBytes(objFile, data);
+                try
+                {
+                    var data = SerializeObject(obj.Value);
+                    Directory.CreateDirectory(objDir);
+                    File.WriteAllBytes(objFile, data);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Warning: Could not flush object {obj.Key}: {ex.Message}");
+                }
             }
         }
     }

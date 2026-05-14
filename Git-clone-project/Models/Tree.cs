@@ -17,6 +17,7 @@ public sealed class Tree : GitObject
     public Tree()
     {
         Type = "tree";
+        Hash = ComputeHash();
     }
 
     public void AddEntry(string mode, string name, string hash, string type)
@@ -28,7 +29,8 @@ public sealed class Tree : GitObject
             Hash = hash,
             Type = type
         });
-        // Do NOT recompute Hash here - caller should call ComputeHash after all entries added
+        // Recompute hash after adding entries
+        Hash = ComputeHash();
     }
 
     protected override byte[] GetContentBytes()

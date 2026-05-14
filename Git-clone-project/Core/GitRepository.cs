@@ -47,42 +47,87 @@ public sealed class GitRepository : IAsyncDisposable
 
     private void InitializeRepository()
     {
-        // Create directory structure
-        if (!Directory.Exists(_gitDirectory))
-            Directory.CreateDirectory(_gitDirectory);
+        try
+        {
+            // Create directory structure
+            if (!Directory.Exists(_gitDirectory))
+                Directory.CreateDirectory(_gitDirectory);
 
-        var objectsPath = Path.Combine(_gitDirectory, "objects");
-        if (!Directory.Exists(objectsPath))
-            Directory.CreateDirectory(objectsPath);
+            var objectsPath = Path.Combine(_gitDirectory, "objects");
+            if (!Directory.Exists(objectsPath))
+                Directory.CreateDirectory(objectsPath);
 
-        var refsHeadsPath = Path.Combine(_gitDirectory, "refs", "heads");
-        if (!Directory.Exists(refsHeadsPath))
-            Directory.CreateDirectory(refsHeadsPath);
+            var refsHeadsPath = Path.Combine(_gitDirectory, "refs", "heads");
+            if (!Directory.Exists(refsHeadsPath))
+                Directory.CreateDirectory(refsHeadsPath);
 
-        // Create empty tree
-        var emptyTree = new Tree();
-        _objectStore.StoreObject(emptyTree);
+            // Create empty tree
+            Console.WriteLine("  Creating empty tree...");
+            var emptyTree = new Tree();
+            _objectStore.StoreObject(emptyTree);
 
-        // Create initial commit
-        var initialCommit = new Commit(emptyTree.Hash, null, "system", "Initial commit", DateTime.UtcNow);
-        _objectStore.StoreObject(initialCommit);
+            if (!string.IsNullOrEmpty(emptyTree.Hash) && emptyTree.Hash != "empty")
+            {
+                Console.WriteLine($"  ✓ Empty tree created: {emptyTree.Hash[..Math.Min(8, emptyTree.Hash.Length)]}");
+            }
+            else
+            {
+                Console.WriteLine($"  ⚠ Empty tree created with hash: {emptyTree.Hash}");
+            }
 
-        // Update main branch reference
-        _referenceManager.UpdateReference("refs/heads/main", initialCommit.Hash);
+            // Create initial commit
+            Console.WriteLine("  Creating initial commit...");
+            var initialCommit = new Commit(emptyTree.Hash, null, "system", "Initial commit", DateTime.UtcNow);
+            _objectStore.StoreObject(initialCommit);
 
-        // Set HEAD to main branch
-        _referenceManager.SetHead("refs/heads/main");
+            if (!string.IsNullOrEmpty(initialCommit.Hash) && initialCommit.Hash != "empty")
+            {
+                Console.WriteLine($"  ✓ Initial commit created: {initialCommit.Hash[..Math.Min(8, initialCommit.Hash.Length)]}");
+            }
+            else
+            {
+                Console.WriteLine($"  ⚠ Initial commit created with hash: {initialCommit.Hash}");
+            }
 
-        // Force save everything
-        _objectStore.Flush();
+            // Update main branch reference
+            Console.WriteLine("  Creating main branch...");
+            _referenceManager.UpdateReference("refs/heads/main", initialCommit.Hash);
+
+            // Set HEAD to main branch
+            Console.WriteLine("  Setting HEAD...");
+            _referenceManager.SetHead("refs/heads/main");
+
+            // Force save everything
+            _objectStore.Flush();
+
+            Console.WriteLine("  ✓ Repository initialization complete!");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"  ✗ Error during initialization: {ex.Message}");
+            Console.WriteLine($"  Stack trace: {ex.StackTrace}");
+            throw;
+        }
     }
 
     private void VerifyInitialization()
     {
-        var currentCommit = _referenceManager.GetCurrentCommit();
-        if (currentCommit != null)
+        try
         {
-            Console.WriteLine($"✓ Repository initialized with commit: {currentCommit[..8]}...");
+            var currentCommit = _referenceManager.GetCurrentCommit();
+            if (!string.IsNullOrEmpty(currentCommit))
+            {
+                var shortHash = currentCommit.Length >= 8 ? currentCommit[..8] : currentCommit;
+                Console.WriteLine($"✓ Repository verified with commit: {shortHash}...");
+            }
+            else
+            {
+                Console.WriteLine("⚠ Repository initialized but no commit found");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"⚠ Verification warning: {ex.Message}");
         }
     }
 
@@ -133,17 +178,22 @@ public sealed class GitRepository : IAsyncDisposable
     // Restore tree helper for checkout
     private async Task RestoreTreeAsync(string treeHash, string dir)
     {
+        if (string.IsNullOrEmpty(treeHash))
+            return;
+
         var tree = await _objectStore.GetObjectAsync(treeHash) as Tree;
-        if (tree == null) return;
+        if (tree == null || tree.Entries == null) return;
 
         foreach (var entry in tree.Entries)
         {
+            if (entry == null) continue;
+
             var fullPath = Path.Combine(dir, entry.Name);
 
             if (entry.Type == "blob")
             {
                 var blob = await _objectStore.GetObjectAsync(entry.Hash) as Blob;
-                if (blob != null)
+                if (blob != null && blob.Data != null)
                 {
                     // Ensure directory exists
                     var fileDir = Path.GetDirectoryName(fullPath);
@@ -206,6 +256,7 @@ public sealed class GitRepository : IAsyncDisposable
     {
         CheckAuthorization(Permission.Commit);
 
+        Console.WriteLine("Creating tree from working directory...");
         var currentTree = await _treeBuilder.CreateTreeFromDirectoryAsync(_workingDirectory);
         await _objectStore.StoreObjectAsync(currentTree);
 
@@ -214,6 +265,9 @@ public sealed class GitRepository : IAsyncDisposable
         await _objectStore.StoreObjectAsync(commit);
 
         _referenceManager.UpdateCurrentBranch(commit.Hash);
+
+        var shortHash = commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
+        Console.WriteLine($"✓ Commit created: {shortHash}...");
 
         return commit.Hash;
     }
@@ -497,10 +551,10 @@ public sealed class GitRepository : IAsyncDisposable
         var currentCommitHash = _referenceManager.GetCurrentCommit();
         var trackedPaths = new HashSet<string>();
 
-        if (currentCommitHash != null)
+        if (!string.IsNullOrEmpty(currentCommitHash))
         {
             var currentCommit = await _objectStore.GetObjectAsync(currentCommitHash) as Commit;
-            if (currentCommit != null)
+            if (currentCommit != null && !string.IsNullOrEmpty(currentCommit.TreeHash))
             {
                 var currentTree = await _objectStore.GetObjectAsync(currentCommit.TreeHash) as Tree;
                 var workingTree = await _treeBuilder.CreateTreeFromDirectoryAsync(_workingDirectory);
@@ -513,10 +567,14 @@ public sealed class GitRepository : IAsyncDisposable
         }
 
         // Check for untracked files
-        var allFiles = Directory.GetFiles(_workingDirectory, "*", SearchOption.AllDirectories)
-            .Where(f => !f.Contains(".gitclone"))
-            .Select(f => Path.GetRelativePath(_workingDirectory, f))
-            .ToList();
+        var allFiles = new List<string>();
+        if (Directory.Exists(_workingDirectory))
+        {
+            allFiles = Directory.GetFiles(_workingDirectory, "*", SearchOption.AllDirectories)
+                .Where(f => !f.Contains(".gitclone"))
+                .Select(f => Path.GetRelativePath(_workingDirectory, f))
+                .ToList();
+        }
 
         status.Untracked = allFiles
             .Where(f => !trackedPaths.Contains(f) && !status.Added.Contains(f))
@@ -525,10 +583,15 @@ public sealed class GitRepository : IAsyncDisposable
         return status;
     }
 
-    private async Task CollectTreePathsAsync(Tree tree, string prefix, HashSet<string> paths)
+    private async Task CollectTreePathsAsync(Tree? tree, string prefix, HashSet<string> paths)
     {
+        if (tree == null || tree.Entries == null)
+            return;
+
         foreach (var entry in tree.Entries)
         {
+            if (entry == null) continue;
+
             if (entry.Type == "blob")
             {
                 paths.Add(prefix + entry.Name);
@@ -562,7 +625,7 @@ public sealed class GitRepository : IAsyncDisposable
         var history = new List<Commit>();
         var currentHash = _referenceManager.GetCurrentCommit();
 
-        while (currentHash is not null)
+        while (!string.IsNullOrEmpty(currentHash))
         {
             var commit = _objectStore.GetObject(currentHash) as Commit;
             if (commit is null)
@@ -580,7 +643,7 @@ public sealed class GitRepository : IAsyncDisposable
         var history = new List<Commit>();
         var currentHash = _referenceManager.GetCurrentCommit();
 
-        while (currentHash is not null)
+        while (!string.IsNullOrEmpty(currentHash))
         {
             var commit = await _objectStore.GetObjectAsync(currentHash) as Commit;
             if (commit is null)
@@ -622,14 +685,15 @@ public sealed class GitRepository : IAsyncDisposable
         CheckAuthorization(Permission.CreateBranch);
 
         var currentCommit = _referenceManager.GetCurrentCommit();
-        if (currentCommit is not null)
+        if (!string.IsNullOrEmpty(currentCommit))
         {
             _referenceManager.UpdateReference($"refs/heads/{branchName}", currentCommit);
-            Console.WriteLine($"Branch '{branchName}' created pointing to {currentCommit[..8]}...");
+            var shortHash = currentCommit.Length >= 8 ? currentCommit[..8] : currentCommit;
+            Console.WriteLine($"✓ Branch '{branchName}' created pointing to {shortHash}...");
         }
         else
         {
-            Console.WriteLine("Cannot create branch: No current commit");
+            Console.WriteLine("Cannot create branch: No commits yet. Make your first commit first.");
         }
     }
 
@@ -640,14 +704,15 @@ public sealed class GitRepository : IAsyncDisposable
         var branchRef = $"refs/heads/{branchName}";
         var commitHash = _referenceManager.GetReference(branchRef);
 
-        if (commitHash is null)
+        if (string.IsNullOrEmpty(commitHash))
         {
             Console.WriteLine($"Branch '{branchName}' not found");
             return false;
         }
 
+        var shortHash = commitHash.Length >= 8 ? commitHash[..8] : commitHash;
         Console.WriteLine($"Switching to branch '{branchName}'...");
-        Console.WriteLine($"Commit: {commitHash[..8]}...");
+        Console.WriteLine($"Commit: {shortHash}...");
 
         // Get the commit and its tree
         var commit = await _objectStore.GetObjectAsync(commitHash) as Commit;
@@ -671,6 +736,7 @@ public sealed class GitRepository : IAsyncDisposable
         Console.WriteLine($"\u001b[32m✓ Switched to branch '{branchName}'\u001b[0m");
         return true;
     }
+
 
     public bool Checkout(string branchName)
     {
@@ -790,7 +856,8 @@ public sealed class GitRepository : IAsyncDisposable
 
         foreach (var commit in history)
         {
-            Console.WriteLine($"\u001b[33mcommit {commit.Hash}\u001b[0m");
+            var shortHash = !string.IsNullOrEmpty(commit.Hash) && commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
+            Console.WriteLine($"\u001b[33mcommit {shortHash}\u001b[0m");
             Console.WriteLine($"Author: {commit.Author}");
             Console.WriteLine($"Date:   {commit.Timestamp:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine($"\n    {commit.Message}\n");
@@ -811,7 +878,8 @@ public sealed class GitRepository : IAsyncDisposable
 
         foreach (var commit in history)
         {
-            Console.WriteLine($"\u001b[33mcommit {commit.Hash}\u001b[0m");
+            var shortHash = commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
+            Console.WriteLine($"\u001b[33mcommit {shortHash}\u001b[0m");
             Console.WriteLine($"Author: {commit.Author}");
             Console.WriteLine($"Date:   {commit.Timestamp:yyyy-MM-dd HH:mm:ss}");
             Console.WriteLine($"\n    {commit.Message}\n");
@@ -851,14 +919,16 @@ public sealed class GitRepository : IAsyncDisposable
 
         // Show current commit
         var currentCommit = _referenceManager.GetCurrentCommit();
-        if (currentCommit != null)
+        if (!string.IsNullOrEmpty(currentCommit))
         {
-            Console.WriteLine($"Current commit: {currentCommit[..8]}...");
+            var shortHash = currentCommit.Length >= 8 ? currentCommit[..8] : currentCommit;
+            Console.WriteLine($"Current commit: {shortHash}...");
             var commit = _objectStore.GetObject(currentCommit) as Commit;
             if (commit != null)
             {
                 Console.WriteLine($"  Message: {commit.Message}");
-                Console.WriteLine($"  Tree: {commit.TreeHash[..8]}...");
+                var shortTreeHash = commit.TreeHash.Length >= 8 ? commit.TreeHash[..8] : commit.TreeHash;
+                Console.WriteLine($"  Tree: {shortTreeHash}...");
                 Console.WriteLine($"  Date: {commit.Timestamp:yyyy-MM-dd HH:mm:ss}");
             }
         }

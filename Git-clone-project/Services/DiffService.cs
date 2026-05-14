@@ -56,10 +56,15 @@ public sealed class DiffService
     {
         var status = new RepositoryStatus();
 
-        if (currentTree == null)
+        if (currentTree == null || currentTree.Entries == null)
         {
             // All files are new
             GetAllFileNames(workingTree, "", status.Added);
+            return status;
+        }
+
+        if (workingTree == null || workingTree.Entries == null)
+        {
             return status;
         }
 
@@ -69,6 +74,8 @@ public sealed class DiffService
         // Check for modified and added files
         foreach (var entry in workingTree.Entries)
         {
+            if (entry == null) continue;
+
             if (!currentEntries.ContainsKey(entry.Name))
             {
                 if (entry.Type == "blob")
@@ -110,6 +117,8 @@ public sealed class DiffService
         // Check for deleted files
         foreach (var entry in currentTree.Entries)
         {
+            if (entry == null) continue;
+
             if (!workingEntries.ContainsKey(entry.Name))
             {
                 if (entry.Type == "blob")
@@ -133,8 +142,12 @@ public sealed class DiffService
 
     private void GetAllFileNames(Tree tree, string prefix, List<string> fileList)
     {
+        if (tree == null || tree.Entries == null) return;
+
         foreach (var entry in tree.Entries)
         {
+            if (entry == null) continue;
+
             if (entry.Type == "blob")
             {
                 fileList.Add(prefix + entry.Name);

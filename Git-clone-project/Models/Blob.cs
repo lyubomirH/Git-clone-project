@@ -1,4 +1,6 @@
-﻿namespace GitClone.Models;
+﻿using System.Text;
+
+namespace GitClone.Models;
 
 public sealed class Blob : GitObject
 {
@@ -7,6 +9,7 @@ public sealed class Blob : GitObject
     public Blob()
     {
         Type = "blob";
+        Hash = ComputeHash();
     }
 
     public Blob(byte[] data) : this()
