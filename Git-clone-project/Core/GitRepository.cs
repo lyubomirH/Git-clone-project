@@ -130,7 +130,7 @@ public sealed class GitRepository : IAsyncDisposable
             throw new UnauthorizedAccessException($"Insufficient permissions. Required: {required}");
     }
 
-    // Restore tree helper for checkout - THIS IS THE KEY FIX
+    // Restore tree helper for checkout
     private async Task RestoreTreeAsync(string treeHash, string dir)
     {
         var tree = await _objectStore.GetObjectAsync(treeHash) as Tree;
@@ -253,6 +253,235 @@ public sealed class GitRepository : IAsyncDisposable
     public string CommitFiles(string message, string author, params string[] filePaths)
     {
         return CommitFilesAsync(message, author, filePaths).GetAwaiter().GetResult();
+    }
+
+    // Revert methods - FIXED VERSION
+    public async Task<string> RevertCommitAsync(string commitHash, string author, string? customMessage = null)
+    {
+        CheckAuthorization(Permission.Commit);
+
+        // Get the commit to revert
+        var commitToRevert = await _objectStore.GetObjectAsync(commitHash) as Commit;
+        if (commitToRevert == null)
+        {
+            throw new ArgumentException($"Commit not found: {commitHash}");
+        }
+
+        // Get the parent of the commit to revert (the state before that commit)
+        Tree? parentTree = null;
+        if (!string.IsNullOrEmpty(commitToRevert.ParentHash))
+        {
+            var parentCommit = await _objectStore.GetObjectAsync(commitToRevert.ParentHash) as Commit;
+            if (parentCommit != null)
+            {
+                parentTree = await _objectStore.GetObjectAsync(parentCommit.TreeHash) as Tree;
+            }
+        }
+
+        // Get the current tree (HEAD)
+        var currentCommitHash = _referenceManager.GetCurrentCommit();
+        Tree? currentTree = null;
+        if (currentCommitHash != null)
+        {
+            var currentCommit = await _objectStore.GetObjectAsync(currentCommitHash) as Commit;
+            if (currentCommit != null)
+            {
+                currentTree = await _objectStore.GetObjectAsync(currentCommit.TreeHash) as Tree;
+            }
+        }
+
+        // Get the tree from the commit to revert (the changes we want to undo)
+        var revertTargetTree = await _objectStore.GetObjectAsync(commitToRevert.TreeHash) as Tree;
+        if (revertTargetTree == null)
+        {
+            throw new InvalidOperationException("Cannot find tree for the commit to revert");
+        }
+
+        // Create a new tree that applies the reverse changes to the current tree
+        Tree revertTree;
+        if (parentTree != null)
+        {
+            // Calculate the diff between parent and target, then apply reverse to current
+            revertTree = await ApplyReverseChangesAsync(currentTree, parentTree, revertTargetTree);
+        }
+        else
+        {
+            // Initial commit - revert means remove all files added in that commit
+            revertTree = await RemoveAddedFilesAsync(currentTree, revertTargetTree);
+        }
+
+        // Store the new tree
+        await _objectStore.StoreObjectAsync(revertTree);
+
+        // Create the revert commit
+        var message = customMessage ?? $"Revert commit: {commitHash[..8]} - {commitToRevert.Message}";
+        var revertCommit = new Commit(revertTree.Hash, currentCommitHash, author, message, DateTime.UtcNow);
+        await _objectStore.StoreObjectAsync(revertCommit);
+
+        // Update current branch
+        _referenceManager.UpdateCurrentBranch(revertCommit.Hash);
+
+        // Update working directory with reverted files
+        Console.WriteLine("Updating working directory with reverted changes...");
+        await RestoreTreeAsync(revertTree.Hash, _workingDirectory);
+
+        return revertCommit.Hash;
+    }
+
+    public string RevertCommit(string commitHash, string author, string? customMessage = null)
+    {
+        return RevertCommitAsync(commitHash, author, customMessage).GetAwaiter().GetResult();
+    }
+
+    // Helper method to apply reverse changes
+    private async Task<Tree> ApplyReverseChangesAsync(Tree? currentTree, Tree parentTree, Tree targetTree)
+    {
+        var entries = new List<TreeEntry>();
+
+        // Start with current tree entries if it exists
+        if (currentTree != null)
+        {
+            foreach (var entry in currentTree.Entries)
+            {
+                entries.Add(new TreeEntry
+                {
+                    Mode = entry.Mode,
+                    Name = entry.Name,
+                    Hash = entry.Hash,
+                    Type = entry.Type
+                });
+            }
+        }
+
+        // Get the diff between parent and target (changes made in the commit to revert)
+        var parentEntries = parentTree.Entries.ToDictionary(e => e.Name);
+        var targetEntries = targetTree.Entries.ToDictionary(e => e.Name);
+
+        // For each file that changed in the commit to revert, reverse the change
+        foreach (var targetEntry in targetTree.Entries)
+        {
+            bool existedInParent = parentEntries.ContainsKey(targetEntry.Name);
+
+            if (!existedInParent)
+            {
+                // File was ADDED in the commit to revert - remove it from current
+                entries.RemoveAll(e => e.Name == targetEntry.Name);
+                Console.WriteLine($"  Will remove: {targetEntry.Name}");
+            }
+            else
+            {
+                var parentEntry = parentEntries[targetEntry.Name];
+                if (parentEntry.Hash != targetEntry.Hash)
+                {
+                    // File was MODIFIED in the commit to revert - revert to parent version
+                    if (parentEntry.Type == "blob")
+                    {
+                        entries.RemoveAll(e => e.Name == parentEntry.Name);
+                        entries.Add(new TreeEntry
+                        {
+                            Mode = parentEntry.Mode,
+                            Name = parentEntry.Name,
+                            Hash = parentEntry.Hash,
+                            Type = parentEntry.Type
+                        });
+                        Console.WriteLine($"  Will revert: {parentEntry.Name} to previous version");
+                    }
+                    else if (parentEntry.Type == "tree")
+                    {
+                        // Handle directory changes recursively
+                        var parentSubTree = await _objectStore.GetObjectAsync(parentEntry.Hash) as Tree;
+                        var targetSubTree = await _objectStore.GetObjectAsync(targetEntry.Hash) as Tree;
+
+                        if (parentSubTree != null && targetSubTree != null)
+                        {
+                            var revertedSubTree = await ApplyReverseChangesAsync(
+                                await _objectStore.GetObjectAsync(parentEntry.Hash) as Tree,
+                                parentSubTree,
+                                targetSubTree
+                            );
+                            await _objectStore.StoreObjectAsync(revertedSubTree);
+
+                            entries.RemoveAll(e => e.Name == parentEntry.Name);
+                            entries.Add(new TreeEntry
+                            {
+                                Mode = parentEntry.Mode,
+                                Name = parentEntry.Name,
+                                Hash = revertedSubTree.Hash,
+                                Type = "tree"
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Check for files DELETED in the commit to revert - restore them
+        foreach (var parentEntry in parentTree.Entries)
+        {
+            if (!targetEntries.ContainsKey(parentEntry.Name))
+            {
+                // File was DELETED in the commit to revert - restore it
+                if (!entries.Any(e => e.Name == parentEntry.Name))
+                {
+                    entries.Add(new TreeEntry
+                    {
+                        Mode = parentEntry.Mode,
+                        Name = parentEntry.Name,
+                        Hash = parentEntry.Hash,
+                        Type = parentEntry.Type
+                    });
+                    Console.WriteLine($"  Will restore: {parentEntry.Name}");
+                }
+            }
+        }
+
+        // Create the new tree
+        var newTree = new Tree();
+        foreach (var entry in entries.OrderBy(e => e.Name))
+        {
+            newTree.Entries.Add(entry);
+        }
+        newTree.Hash = newTree.ComputeHash();
+
+        return newTree;
+    }
+
+    // Helper method for reverting initial commit
+    private async Task<Tree> RemoveAddedFilesAsync(Tree? currentTree, Tree targetTree)
+    {
+        var entries = new List<TreeEntry>();
+
+        // Start with current tree entries if it exists
+        if (currentTree != null)
+        {
+            foreach (var entry in currentTree.Entries)
+            {
+                // Only keep entries that were not added in the target commit
+                if (!targetTree.Entries.Any(e => e.Name == entry.Name))
+                {
+                    entries.Add(new TreeEntry
+                    {
+                        Mode = entry.Mode,
+                        Name = entry.Name,
+                        Hash = entry.Hash,
+                        Type = entry.Type
+                    });
+                }
+                else
+                {
+                    Console.WriteLine($"  Will remove: {entry.Name}");
+                }
+            }
+        }
+
+        var newTree = new Tree();
+        foreach (var entry in entries.OrderBy(e => e.Name))
+        {
+            newTree.Entries.Add(entry);
+        }
+        newTree.Hash = newTree.ComputeHash();
+
+        return newTree;
     }
 
     // Status methods
@@ -404,7 +633,6 @@ public sealed class GitRepository : IAsyncDisposable
         }
     }
 
-    // FIXED: Complete checkout implementation
     public async Task<bool> CheckoutAsync(string branchName)
     {
         CheckAuthorization(Permission.Read);
@@ -429,7 +657,7 @@ public sealed class GitRepository : IAsyncDisposable
             return false;
         }
 
-        // Clear current working directory (optional - comment out if you want to keep files)
+        // Clear current working directory
         Console.WriteLine("Clearing working directory...");
         ClearWorkingDirectory(_workingDirectory);
 

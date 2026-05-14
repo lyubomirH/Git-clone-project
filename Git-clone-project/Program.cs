@@ -419,6 +419,11 @@ internal static class Program
                         exit = true;
                         break;
 
+                    case "revert":
+                    case "rv":
+                        await HandleRevert(args);
+                        break;
+
                     default:
                         Console.WriteLine($"\u001b[31mUnknown command: {command}\u001b[0m");
                         Console.WriteLine("Type 'help' for available commands");
@@ -862,6 +867,230 @@ internal static class Program
         }
     }
 
+    private static async Task HandleRevert(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            Console.WriteLine("Usage: revert <commit-hash> [message]");
+            Console.WriteLine("Example: revert abc123 \"Reverting the last change\"");
+            Console.WriteLine();
+            Console.WriteLine("This will create a new commit that undoes the changes from the specified commit.");
+            return;
+        }
+
+        var commitHash = args[0];
+        var customMessage = args.Length > 1 ? string.Join(" ", args.Skip(1)) : null;
+        var author = _repository?.GetCurrentUser()?.Username ?? "unknown";
+
+        // Show what commit we're reverting
+        var commitToRevert = await _repository!.GetObjectAsync(commitHash) as Commit;
+        if (commitToRevert == null)
+        {
+            Console.WriteLine($"\u001b[31mError: Commit '{commitHash}' not found\u001b[0m");
+            return;
+        }
+
+        Console.WriteLine($"\n\u001b[36mReverting commit:\u001b[0m");
+        Console.WriteLine($"  Hash: {commitToRevert.Hash}");
+        Console.WriteLine($"  Message: {commitToRevert.Message}");
+        Console.WriteLine($"  Author: {commitToRevert.Author}");
+        Console.WriteLine($"  Date: {commitToRevert.Timestamp:yyyy-MM-dd HH:mm:ss}");
+        Console.WriteLine();
+
+        // Show what files will be affected
+        Console.WriteLine("\u001b[33mThis will revert the following changes:\u001b[0m");
+
+        // Get the current commit from history (most recent commit)
+        var history = _repository.GetCommitHistory();
+        var currentCommit = history.FirstOrDefault();
+
+        if (currentCommit != null)
+        {
+            var currentTree = await _repository.GetObjectAsync(currentCommit.TreeHash) as Tree;
+            var targetTree = await _repository.GetObjectAsync(commitToRevert.TreeHash) as Tree;
+
+            await ShowRevertChangesAsync(currentTree, targetTree);
+        }
+        else
+        {
+            Console.WriteLine("  No previous commits found.");
+        }
+
+        Console.Write("\nProceed with revert? (y/n): ");
+        var confirm = Console.ReadLine()?.ToLower();
+
+        if (confirm != "y")
+        {
+            Console.WriteLine("Revert cancelled.");
+            return;
+        }
+
+        try
+        {
+            Console.WriteLine("\nCreating revert commit...");
+            var newCommitHash = await _repository.RevertCommitAsync(commitHash, author, customMessage);
+            Console.WriteLine($"\u001b[32m✓ Revert commit created successfully!\u001b[0m");
+            Console.WriteLine($"  New commit: {newCommitHash[..8]}...");
+            Console.WriteLine($"  Working directory updated with reverted changes.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\u001b[31m✗ Error reverting commit: {ex.Message}\u001b[0m");
+        }
+    }
+
+    private static async Task ShowRevertChangesAsync(Tree? currentTree, Tree? targetTree)
+    {
+        if (currentTree == null && targetTree == null)
+        {
+            Console.WriteLine("  No changes to revert.");
+            return;
+        }
+
+        if (currentTree == null)
+        {
+            Console.WriteLine("  This will remove all files from the repository.");
+            return;
+        }
+
+        if (targetTree == null)
+        {
+            Console.WriteLine("  This will restore all files to the repository.");
+            return;
+        }
+
+        var changedFiles = new List<string>();
+        var addedFiles = new List<string>();
+        var deletedFiles = new List<string>();
+
+        var currentEntries = currentTree.Entries.ToDictionary(e => e.Name);
+        var targetEntries = targetTree.Entries.ToDictionary(e => e.Name);
+
+        var allNames = currentEntries.Keys.Union(targetEntries.Keys).Distinct();
+
+        foreach (var name in allNames)
+        {
+            bool hasCurrent = currentEntries.ContainsKey(name);
+            bool hasTarget = targetEntries.ContainsKey(name);
+
+            if (hasTarget && !hasCurrent)
+            {
+                // File was added in target commit - will be removed
+                addedFiles.Add(name);
+            }
+            else if (!hasTarget && hasCurrent)
+            {
+                // File was deleted in target commit - will be restored
+                deletedFiles.Add(name);
+            }
+            else if (hasTarget && hasCurrent)
+            {
+                var currentEntry = currentEntries[name];
+                var targetEntry = targetEntries[name];
+
+                if (currentEntry.Hash != targetEntry.Hash)
+                {
+                    if (currentEntry.Type == "blob" && targetEntry.Type == "blob")
+                    {
+                        changedFiles.Add(name);
+                    }
+                    else if (currentEntry.Type == "tree" && targetEntry.Type == "tree")
+                    {
+                        // Recursively check subdirectories
+                        var subCurrent = await _repository!.GetObjectAsync(currentEntry.Hash) as Tree;
+                        var subTarget = await _repository!.GetObjectAsync(targetEntry.Hash) as Tree;
+                        if (subCurrent != null && subTarget != null)
+                        {
+                            var subChanges = await GetTreeDiffAsync(subCurrent, subTarget);
+                            changedFiles.AddRange(subChanges.Select(f => Path.Combine(name, f)));
+                        }
+                    }
+                }
+            }
+        }
+
+        if (addedFiles.Any())
+        {
+            Console.WriteLine($"  \u001b[31m- Files that will be REMOVED: {addedFiles.Count}\u001b[0m");
+            foreach (var file in addedFiles.Take(10))
+                Console.WriteLine($"      {file}");
+            if (addedFiles.Count > 10)
+                Console.WriteLine($"      ... and {addedFiles.Count - 10} more");
+        }
+
+        if (deletedFiles.Any())
+        {
+            Console.WriteLine($"  \u001b[32m+ Files that will be RESTORED: {deletedFiles.Count}\u001b[0m");
+            foreach (var file in deletedFiles.Take(10))
+                Console.WriteLine($"      {file}");
+            if (deletedFiles.Count > 10)
+                Console.WriteLine($"      ... and {deletedFiles.Count - 10} more");
+        }
+
+        if (changedFiles.Any())
+        {
+            Console.WriteLine($"  \u001b[33m✎ Files that will be MODIFIED: {changedFiles.Count}\u001b[0m");
+            foreach (var file in changedFiles.Take(10))
+                Console.WriteLine($"      {file}");
+            if (changedFiles.Count > 10)
+                Console.WriteLine($"      ... and {changedFiles.Count - 10} more");
+        }
+
+        if (!addedFiles.Any() && !deletedFiles.Any() && !changedFiles.Any())
+        {
+            Console.WriteLine("  No changes detected - commit has already been reverted or no effect.");
+        }
+    }
+
+    private static async Task<List<string>> GetTreeDiffAsync(Tree tree1, Tree tree2)
+    {
+        var diff = new List<string>();
+        var dict1 = tree1.Entries.ToDictionary(e => e.Name);
+        var dict2 = tree2.Entries.ToDictionary(e => e.Name);
+
+        foreach (var entry in tree2.Entries)
+        {
+            if (!dict1.ContainsKey(entry.Name) || dict1[entry.Name].Hash != entry.Hash)
+            {
+                if (entry.Type == "blob")
+                {
+                    diff.Add(entry.Name);
+                }
+                else if (entry.Type == "tree")
+                {
+                    var subTree1 = await _repository!.GetObjectAsync(dict1.GetValueOrDefault(entry.Name)?.Hash ?? "") as Tree;
+                    var subTree2 = await _repository!.GetObjectAsync(entry.Hash) as Tree;
+                    if (subTree1 != null && subTree2 != null)
+                    {
+                        var subDiff = await GetTreeDiffAsync(subTree1, subTree2);
+                        diff.AddRange(subDiff.Select(f => Path.Combine(entry.Name, f)));
+                    }
+                }
+            }
+        }
+
+        return diff;
+    }
+
+    private static async Task CollectTreeFilesAsync(Tree tree, string prefix, List<string> files)
+    {
+        foreach (var entry in tree.Entries)
+        {
+            if (entry.Type == "blob")
+            {
+                files.Add(prefix + entry.Name);
+            }
+            else if (entry.Type == "tree")
+            {
+                var subTree = await _repository!.GetObjectAsync(entry.Hash) as Tree;
+                if (subTree != null)
+                {
+                    await CollectTreeFilesAsync(subTree, prefix + entry.Name + "/", files);
+                }
+            }
+        }
+    }
+
     private static void HandleCd(string[] args)
     {
         // Join all args since they might be part of a quoted path
@@ -937,7 +1166,7 @@ internal static class Program
     private static void ShowHelp()
     {
         Console.WriteLine("\n\u001b[36m╔══════════════════════════════════════════════════════════════╗\u001b[0m");
-        Console.WriteLine("\u001b[36m║                    AVAILABLE COMMANDS                         ║\u001b[0m");
+        Console.WriteLine("\u001b[36m║                    AVAILABLE COMMANDS                        ║\u001b[0m");
         Console.WriteLine("\u001b[36m╚══════════════════════════════════════════════════════════════╝\u001b[0m");
         Console.WriteLine();
 
@@ -950,6 +1179,7 @@ internal static class Program
         {
             Console.WriteLine("\u001b[33mBasic Commands:\u001b[0m");
             Console.WriteLine($"  {"commit, c [files...]",-35} - Commit changes (specific files optional)");
+            Console.WriteLine($"  {"revert, rv <hash> [message]",-35} - Revert a previous commit");
             Console.WriteLine($"  {"status, s",-35} - Show working directory status");
             Console.WriteLine($"  {"log, l",-35} - Show commit history");
             Console.WriteLine($"  {"diff, d <c1> <c2>",-35} - Show diff between commits");
