@@ -12,7 +12,13 @@ public class User
     public DateTime CreatedAt { get; set; }
     public DateTime LastLogin { get; set; }
     public bool IsActive { get; set; } = true;
-    public List<string> AllowedRepositories { get; set; } = new();
+    public List<string> AllowedRepositories { get; set; } = new List<string>();
+
+    public void GrantAccessToAllRepositories()
+    {
+        AllowedRepositories.Clear();
+        AllowedRepositories.Add("*");
+    }
 
     public void SetPassword(string password)
     {

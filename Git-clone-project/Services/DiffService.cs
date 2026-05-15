@@ -14,42 +14,98 @@ public sealed class DiffService
 
     public void DiffCommits(string commitHash1, string commitHash2)
     {
+        if (string.IsNullOrEmpty(commitHash1) || string.IsNullOrEmpty(commitHash2))
+        {
+            Console.WriteLine("Invalid commit hashes provided");
+            return;
+        }
+
         var commit1 = _objectStore.GetObject(commitHash1) as Commit;
         var commit2 = _objectStore.GetObject(commitHash2) as Commit;
 
-        if (commit1 is null || commit2 is null)
+        if (commit1 is null)
         {
-            Console.WriteLine("Invalid commit hash");
+            Console.WriteLine($"Commit not found: {commitHash1}");
+            return;
+        }
+
+        if (commit2 is null)
+        {
+            Console.WriteLine($"Commit not found: {commitHash2}");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(commit1.TreeHash) || string.IsNullOrEmpty(commit2.TreeHash))
+        {
+            Console.WriteLine("Invalid commit trees");
             return;
         }
 
         var tree1 = _objectStore.GetObject(commit1.TreeHash) as Tree;
         var tree2 = _objectStore.GetObject(commit2.TreeHash) as Tree;
 
-        if (tree1 is not null && tree2 is not null)
+        if (tree1 is null)
         {
-            DiffTrees(tree1, tree2, "");
+            Console.WriteLine($"Tree not found for commit: {commitHash1}");
+            return;
         }
+
+        if (tree2 is null)
+        {
+            Console.WriteLine($"Tree not found for commit: {commitHash2}");
+            return;
+        }
+
+        Console.WriteLine($"\n\u001b[36mDiff between {commitHash1[..Math.Min(8, commitHash1.Length)]} and {commitHash2[..Math.Min(8, commitHash2.Length)]}:\u001b[0m");
+        DiffTrees(tree1, tree2, "");
     }
 
     public async Task DiffCommitsAsync(string commitHash1, string commitHash2)
     {
+        if (string.IsNullOrEmpty(commitHash1) || string.IsNullOrEmpty(commitHash2))
+        {
+            Console.WriteLine("Invalid commit hashes provided");
+            return;
+        }
+
         var commit1 = await _objectStore.GetObjectAsync(commitHash1) as Commit;
         var commit2 = await _objectStore.GetObjectAsync(commitHash2) as Commit;
 
-        if (commit1 is null || commit2 is null)
+        if (commit1 is null)
         {
-            Console.WriteLine("Invalid commit hash");
+            Console.WriteLine($"Commit not found: {commitHash1}");
+            return;
+        }
+
+        if (commit2 is null)
+        {
+            Console.WriteLine($"Commit not found: {commitHash2}");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(commit1.TreeHash) || string.IsNullOrEmpty(commit2.TreeHash))
+        {
+            Console.WriteLine("Invalid commit trees");
             return;
         }
 
         var tree1 = await _objectStore.GetObjectAsync(commit1.TreeHash) as Tree;
         var tree2 = await _objectStore.GetObjectAsync(commit2.TreeHash) as Tree;
 
-        if (tree1 is not null && tree2 is not null)
+        if (tree1 is null)
         {
-            await DiffTreesAsync(tree1, tree2, "");
+            Console.WriteLine($"Tree not found for commit: {commitHash1}");
+            return;
         }
+
+        if (tree2 is null)
+        {
+            Console.WriteLine($"Tree not found for commit: {commitHash2}");
+            return;
+        }
+
+        Console.WriteLine($"\n\u001b[36mDiff between {commitHash1[..Math.Min(8, commitHash1.Length)]} and {commitHash2[..Math.Min(8, commitHash2.Length)]}:\u001b[0m");
+        await DiffTreesAsync(tree1, tree2, "");
     }
 
     public async Task<RepositoryStatus> GetStatusAsync(Tree? currentTree, Tree workingTree)

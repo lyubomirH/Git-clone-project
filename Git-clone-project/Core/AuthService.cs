@@ -147,10 +147,24 @@ public class AuthService
             Email = email,
             Role = role,
             CreatedAt = DateTime.UtcNow,
-            IsActive = true
+            IsActive = true,
+            AllowedRepositories = new List<string>() // Initialize empty list
         };
-        user.SetPassword(password);
 
+        // For non-admin users, grant access to current repository
+        // This will be set by the admin when creating the user
+        if (role != UserRole.Admin)
+        {
+            // Don't add default repository - admin must grant access
+            Console.WriteLine($"Created user {username} with role {role}. Admin must grant repository access.");
+        }
+        else
+        {
+            // Admin has access to all repositories
+            user.GrantAccessToAllRepositories();
+        }
+
+        user.SetPassword(password);
         _users[username] = user;
         SaveUsers();
         return true;
@@ -168,6 +182,27 @@ public class AuthService
             }
         }
         return false;
+    }
+
+    public bool RegisterUserWithRepository(string username, string password, string email, string repositoryName, UserRole role = UserRole.User)
+    {
+        if (_users.ContainsKey(username))
+            return false;
+
+        var user = new User
+        {
+            Username = username,
+            Email = email,
+            Role = role,
+            CreatedAt = DateTime.UtcNow,
+            IsActive = true,
+            AllowedRepositories = new List<string> { repositoryName }
+        };
+
+        user.SetPassword(password);
+        _users[username] = user;
+        SaveUsers();
+        return true;
     }
 
     public bool DeleteUser(string username)
@@ -211,19 +246,44 @@ public class AuthService
         if (!IsAuthenticated())
             return false;
 
-        // Admin has access to everything
-        if (_currentUser!.Role == UserRole.Admin)
-            return true;
+        if (_currentUser == null)
+            return false;
 
-        // Check if user has specific repository access
-        if (_currentUser.AllowedRepositories.Contains(repositoryName) ||
-            _currentUser.AllowedRepositories.Contains("*"))
+        // Debug output
+        Console.WriteLine($"Checking access: User={_currentUser.Username}, Role={_currentUser.Role}, Repo={repositoryName}, Required={required}");
+
+        // Get user's role-based permissions
+        var userPermissions = PermissionHelper.GetPermissionsForRole(_currentUser.Role);
+
+        // Admin has access to everything regardless of repository restrictions
+        if (_currentUser.Role == UserRole.Admin)
         {
-            var userPermissions = PermissionHelper.GetPermissionsForRole(_currentUser.Role);
+            Console.WriteLine($"Admin access granted for {_currentUser.Username}");
             return PermissionHelper.HasPermission(userPermissions, required);
         }
 
-        return false;
+        // For non-admin users, if no repository restrictions, allow access
+        if (_currentUser.AllowedRepositories == null || _currentUser.AllowedRepositories.Count == 0)
+        {
+            Console.WriteLine($"No repository restrictions for {_currentUser.Username}, allowing access");
+            return PermissionHelper.HasPermission(userPermissions, required);
+        }
+
+        // Check if user has access to this specific repository
+        bool hasRepoAccess = _currentUser.AllowedRepositories.Contains(repositoryName) ||
+                             _currentUser.AllowedRepositories.Contains("*");
+
+        if (!hasRepoAccess)
+        {
+            Console.WriteLine($"User {_currentUser.Username} does not have access to repository '{repositoryName}'");
+            Console.WriteLine($"Allowed repositories: {string.Join(", ", _currentUser.AllowedRepositories)}");
+            return false;
+        }
+
+        // Check if the user's role has the required permission
+        var result = PermissionHelper.HasPermission(userPermissions, required);
+        Console.WriteLine($"Permission check: Required={required}, UserPermissions={userPermissions}, Result={result}");
+        return result;
     }
 
     public void GrantRepositoryAccess(string username, string repositoryName)

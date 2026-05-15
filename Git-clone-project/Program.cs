@@ -219,6 +219,7 @@ internal static class Program
         {
             // Admin only commands
             "users" => UserRole.Admin,
+            "grant" => UserRole.Admin,
             "delete-branch" => UserRole.Maintainer,
             "db" => UserRole.Maintainer,
 
@@ -227,7 +228,8 @@ internal static class Program
             "b" => UserRole.Developer,
             "checkout" => UserRole.Developer,
             "co" => UserRole.Developer,
-            "merge" => UserRole.Developer,
+            "revert" => UserRole.Developer,
+            "rv" => UserRole.Developer,
 
             // User commands (everyone logged in)
             "commit" => UserRole.User,
@@ -241,6 +243,8 @@ internal static class Program
             "verify" => UserRole.User,
             "v" => UserRole.User,
             "whoami" => UserRole.User,
+            "permissions" => UserRole.User,
+            "perms" => UserRole.User,
 
             // Guest commands (even non-logged in users)
             "dir" => UserRole.Guest,
@@ -289,7 +293,7 @@ internal static class Program
                 _ => "👁️"
             };
 
-            // Show current directory (relative to repository root if possible)
+            // Show current directory
             string displayDir;
             if (_currentWorkingDirectory == _repositoryRoot)
             {
@@ -350,6 +354,11 @@ internal static class Program
                         await HandleDiff(args);
                         break;
 
+                    case "revert":
+                    case "rv":
+                        await HandleRevert(args);
+                        break;
+
                     case "branch":
                     case "b":
                         await HandleBranch(args);
@@ -375,6 +384,10 @@ internal static class Program
                         await HandleUsers(args);
                         break;
 
+                    case "grant":
+                        await HandleGrant(args);
+                        break;
+
                     case "dir":
                     case "ls":
                         await HandleDir(args);
@@ -395,7 +408,11 @@ internal static class Program
 
                     case "whoami":
                         Console.WriteLine(_repository?.GetCurrentUserInfo());
-                        Console.WriteLine($"Role: {_currentUserRole}");
+                        break;
+
+                    case "permissions":
+                    case "perms":
+                        _repository?.ShowMyPermissions();
                         break;
 
                     case "logout":
@@ -417,11 +434,6 @@ internal static class Program
                     case "quit":
                     case "q":
                         exit = true;
-                        break;
-
-                    case "revert":
-                    case "rv":
-                        await HandleRevert(args);
                         break;
 
                     default:
@@ -465,63 +477,65 @@ internal static class Program
 
         var author = _repository?.GetCurrentUser()?.Username ?? "unknown";
 
-        if (args.Length > 0)
+        try
         {
-            var files = args;
-            Console.WriteLine($"\nCommitting specific files:");
-            foreach (var file in files)
+            if (args.Length > 0)
             {
-                Console.WriteLine($"  - {file}");
-            }
+                var files = args;
+                Console.WriteLine($"\nCommitting specific files:");
+                foreach (var file in files)
+                {
+                    Console.WriteLine($"  - {file}");
+                }
 
-            Console.Write("\nProceed? (y/n): ");
-            var confirm = Console.ReadLine()?.ToLower();
+                Console.Write("\nProceed? (y/n): ");
+                var confirm = Console.ReadLine()?.ToLower();
 
-            if (confirm == "y")
-            {
-                try
+                if (confirm == "y")
                 {
                     var commitHash = await _repository!.CommitFilesAsync(message, author, files);
                     Console.WriteLine($"\u001b[32m✓ Commit created successfully!\u001b[0m");
-                    Console.WriteLine($"  Hash: {commitHash[..8]}...");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"\u001b[31m✗ Error creating commit: {ex.Message}\u001b[0m");
+                    var shortHash = commitHash.Length >= 8 ? commitHash[..8] : commitHash;
+                    Console.WriteLine($"  Hash: {shortHash}...");
                 }
             }
-        }
-        else
-        {
-            await HandleStatus();
-
-            Console.Write("\nCommit all changes? (y/n): ");
-            var confirm = Console.ReadLine()?.ToLower();
-
-            if (confirm == "y")
+            else
             {
-                try
+                await HandleStatus();
+
+                Console.Write("\nCommit all changes? (y/n): ");
+                var confirm = Console.ReadLine()?.ToLower();
+
+                if (confirm == "y")
                 {
                     var commitHash = await _repository!.CommitAsync(message, author);
                     Console.WriteLine($"\u001b[32m✓ Commit created successfully!\u001b[0m");
-                    Console.WriteLine($"  Hash: {commitHash[..8]}...");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"\u001b[31m✗ Error creating commit: {ex.Message}\u001b[0m");
+                    var shortHash = commitHash.Length >= 8 ? commitHash[..8] : commitHash;
+                    Console.WriteLine($"  Hash: {shortHash}...");
                 }
             }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\u001b[31m⛔ Permission Denied: {ex.Message}\u001b[0m");
+            Console.WriteLine("\n\u001b[33mTip: Different roles have different permissions:\u001b[0m");
+            Console.WriteLine("  👤 User     - Can commit and view");
+            Console.WriteLine("  🔧 Developer - Can commit, create branches");
+            Console.WriteLine("  ⭐ Maintainer - Can commit, create/delete branches");
+            Console.WriteLine("  👑 Admin    - Full access");
+            Console.WriteLine("\nAsk an admin to upgrade your role if needed.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\u001b[31m✗ Error creating commit: {ex.Message}\u001b[0m");
         }
     }
 
     private static async Task HandleStatus()
     {
-        // Check if we're inside the repository
         if (!_currentWorkingDirectory.StartsWith(_repositoryRoot!))
         {
             Console.WriteLine("\u001b[31mError: You are outside the repository. Cannot show status.\u001b[0m");
-            Console.WriteLine($"Repository root: {_repositoryRoot}");
-            Console.WriteLine($"Current directory: {_currentWorkingDirectory}");
             return;
         }
 
@@ -560,6 +574,8 @@ internal static class Program
         {
             Console.WriteLine("Usage: diff <commit1> <commit2>");
             Console.WriteLine("Example: diff abc123 def456");
+            Console.WriteLine();
+            Console.WriteLine("You can use full commit hashes or the first 8 characters.");
             return;
         }
 
@@ -573,11 +589,84 @@ internal static class Program
         }
     }
 
+    private static async Task HandleRevert(string[] args)
+    {
+        if (args.Length < 1)
+        {
+            Console.WriteLine("Usage: revert <commit-hash> [message]");
+            Console.WriteLine("Example: revert abc123 \"Reverting the last change\"");
+            Console.WriteLine();
+            Console.WriteLine("This will create a new commit that undoes the changes from the specified commit.");
+            Console.WriteLine("You can use full commit hashes or the first 8 characters.");
+            return;
+        }
+
+        var commitHash = args[0];
+        var customMessage = args.Length > 1 ? string.Join(" ", args.Skip(1)) : null;
+        var author = _repository?.GetCurrentUser()?.Username ?? "unknown";
+
+        try
+        {
+            var history = _repository!.GetCommitHistory();
+            var targetCommit = history.FirstOrDefault(c =>
+                c.Hash.Equals(commitHash, StringComparison.OrdinalIgnoreCase) ||
+                c.Hash.StartsWith(commitHash, StringComparison.OrdinalIgnoreCase));
+
+            if (targetCommit == null)
+            {
+                Console.WriteLine($"\u001b[31mError: Commit '{commitHash}' not found\u001b[0m");
+                Console.WriteLine("\nAvailable commits:");
+                foreach (var c in history.Take(10))
+                {
+                    var shortHash = c.Hash.Length >= 8 ? c.Hash[..8] : c.Hash;
+                    Console.WriteLine($"  {shortHash} - {c.Message}");
+                }
+                return;
+            }
+
+            Console.WriteLine($"\n\u001b[36mReverting commit:\u001b[0m");
+            var shortTargetHash = targetCommit.Hash.Length >= 8 ? targetCommit.Hash[..8] : targetCommit.Hash;
+            Console.WriteLine($"  Hash: {shortTargetHash}...");
+            Console.WriteLine($"  Message: {targetCommit.Message}");
+            Console.WriteLine($"  Author: {targetCommit.Author}");
+            Console.WriteLine($"  Date: {targetCommit.Timestamp:yyyy-MM-dd HH:mm:ss}");
+            Console.WriteLine();
+
+            await _repository.ShowRevertChangesAsync(commitHash);
+
+            Console.Write("\nProceed with revert? (y/n): ");
+            var confirm = Console.ReadLine()?.ToLower();
+
+            if (confirm != "y")
+            {
+                Console.WriteLine("Revert cancelled.");
+                return;
+            }
+
+            Console.WriteLine("\nCreating revert commit...");
+            var newCommitHash = await _repository.RevertCommitAsync(commitHash, author, customMessage);
+            var shortNewHash = newCommitHash.Length >= 8 ? newCommitHash[..8] : newCommitHash;
+            Console.WriteLine($"\u001b[32m✓ Revert commit created successfully!\u001b[0m");
+            Console.WriteLine($"  New commit: {shortNewHash}...");
+            Console.WriteLine($"  Working directory updated with reverted changes.");
+
+            Console.WriteLine("\n\u001b[36mUpdated commit history:\u001b[0m");
+            await _repository.LogAsync();
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\u001b[31m⛔ Permission Denied: {ex.Message}\u001b[0m");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\u001b[31m✗ Error reverting commit: {ex.Message}\u001b[0m");
+        }
+    }
+
     private static async Task HandleBranch(string[] args)
     {
         if (args.Length == 0)
         {
-            // List all branches
             Console.WriteLine("\n\u001b[36mBranches:\u001b[0m");
             Console.WriteLine(new string('-', 40));
             try
@@ -607,16 +696,14 @@ internal static class Program
         }
         else if (args.Length == 1)
         {
-            // Create branch
             var branchName = args[0];
             try
             {
                 _repository?.CreateBranch(branchName);
-                Console.WriteLine($"\u001b[32m✓ Branch '{branchName}' created\u001b[0m");
             }
-            catch (Exception ex)
+            catch (UnauthorizedAccessException ex)
             {
-                Console.WriteLine($"\u001b[31mError creating branch: {ex.Message}\u001b[0m");
+                Console.WriteLine($"\u001b[31m⛔ {ex.Message}\u001b[0m");
             }
         }
         else
@@ -641,6 +728,10 @@ internal static class Program
                 Console.WriteLine($"\u001b[32m✓ Switched to branch '{branchName}'\u001b[0m");
             }
         }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\u001b[31m⛔ {ex.Message}\u001b[0m");
+        }
         catch (Exception ex)
         {
             Console.WriteLine($"\u001b[31mError checking out branch: {ex.Message}\u001b[0m");
@@ -662,6 +753,10 @@ internal static class Program
             {
                 Console.WriteLine($"\u001b[32m✓ Branch '{branchName}' deleted\u001b[0m");
             }
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\u001b[31m⛔ {ex.Message}\u001b[0m");
         }
         catch (Exception ex)
         {
@@ -686,7 +781,8 @@ internal static class Program
             return;
         }
 
-        Console.WriteLine($"\nVerifying commit: {hash[..Math.Min(8, hash.Length)]}...");
+        var shortHash = hash.Length >= 8 ? hash[..8] : hash;
+        Console.WriteLine($"\nVerifying commit: {shortHash}...");
         try
         {
             var isValid = await _repository!.VerifyIntegrityAsync(hash);
@@ -710,7 +806,6 @@ internal static class Program
     {
         if (args.Length == 0)
         {
-            // List users
             try
             {
                 var users = _repository?.GetAllUsers();
@@ -764,10 +859,13 @@ internal static class Program
                     };
                 }
 
-                if (_repository?.RegisterUser(args[1], args[2], args[3], role) == true)
+                var repoName = Path.GetFileName(_repositoryRoot!);
+
+                if (_repository?.RegisterUserWithRepository(args[1], args[2], args[3], repoName, role) == true)
                 {
-                    Console.WriteLine($"\u001b[32m✓ User '{args[1]}' created successfully\u001b[0m");
+                    Console.WriteLine($"\u001b[32m✓ User '{args[1]}' created successfully!\u001b[0m");
                     Console.WriteLine($"  Role: {role}");
+                    Console.WriteLine($"  Repository access: {repoName}");
                 }
                 else
                 {
@@ -816,13 +914,38 @@ internal static class Program
         }
     }
 
+    private static async Task HandleGrant(string[] args)
+    {
+        if (args.Length != 2)
+        {
+            Console.WriteLine("Usage: grant <username> <repository>");
+            Console.WriteLine("Example: grant developer myrepo");
+            return;
+        }
+
+        var username = args[0];
+        var repository = args[1];
+
+        try
+        {
+            _repository?.GrantUserRepositoryAccess(username, repository);
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            Console.WriteLine($"\u001b[31m{ex.Message}\u001b[0m");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\u001b[31mError granting access: {ex.Message}\u001b[0m");
+        }
+    }
+
     private static async Task HandleDir(string[] args)
     {
         var showAll = false;
         var showDetails = false;
         var path = "";
 
-        // Parse arguments
         foreach (var arg in args)
         {
             if (arg == "/a" || arg == "-a" || arg == "--all")
@@ -835,7 +958,6 @@ internal static class Program
 
         try
         {
-            // Resolve path relative to current working directory
             string targetPath;
             if (string.IsNullOrEmpty(path))
             {
@@ -867,236 +989,10 @@ internal static class Program
         }
     }
 
-    private static async Task HandleRevert(string[] args)
-    {
-        if (args.Length < 1)
-        {
-            Console.WriteLine("Usage: revert <commit-hash> [message]");
-            Console.WriteLine("Example: revert abc123 \"Reverting the last change\"");
-            Console.WriteLine();
-            Console.WriteLine("This will create a new commit that undoes the changes from the specified commit.");
-            return;
-        }
-
-        var commitHash = args[0];
-        var customMessage = args.Length > 1 ? string.Join(" ", args.Skip(1)) : null;
-        var author = _repository?.GetCurrentUser()?.Username ?? "unknown";
-
-        // Show what commit we're reverting
-        var commitToRevert = await _repository!.GetObjectAsync(commitHash) as Commit;
-        if (commitToRevert == null)
-        {
-            Console.WriteLine($"\u001b[31mError: Commit '{commitHash}' not found\u001b[0m");
-            return;
-        }
-
-        Console.WriteLine($"\n\u001b[36mReverting commit:\u001b[0m");
-        Console.WriteLine($"  Hash: {commitToRevert.Hash}");
-        Console.WriteLine($"  Message: {commitToRevert.Message}");
-        Console.WriteLine($"  Author: {commitToRevert.Author}");
-        Console.WriteLine($"  Date: {commitToRevert.Timestamp:yyyy-MM-dd HH:mm:ss}");
-        Console.WriteLine();
-
-        // Show what files will be affected
-        Console.WriteLine("\u001b[33mThis will revert the following changes:\u001b[0m");
-
-        // Get the current commit from history (most recent commit)
-        var history = _repository.GetCommitHistory();
-        var currentCommit = history.FirstOrDefault();
-
-        if (currentCommit != null)
-        {
-            var currentTree = await _repository.GetObjectAsync(currentCommit.TreeHash) as Tree;
-            var targetTree = await _repository.GetObjectAsync(commitToRevert.TreeHash) as Tree;
-
-            await ShowRevertChangesAsync(currentTree, targetTree);
-        }
-        else
-        {
-            Console.WriteLine("  No previous commits found.");
-        }
-
-        Console.Write("\nProceed with revert? (y/n): ");
-        var confirm = Console.ReadLine()?.ToLower();
-
-        if (confirm != "y")
-        {
-            Console.WriteLine("Revert cancelled.");
-            return;
-        }
-
-        try
-        {
-            Console.WriteLine("\nCreating revert commit...");
-            var newCommitHash = await _repository.RevertCommitAsync(commitHash, author, customMessage);
-            Console.WriteLine($"\u001b[32m✓ Revert commit created successfully!\u001b[0m");
-            Console.WriteLine($"  New commit: {newCommitHash[..8]}...");
-            Console.WriteLine($"  Working directory updated with reverted changes.");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"\u001b[31m✗ Error reverting commit: {ex.Message}\u001b[0m");
-        }
-    }
-
-    private static async Task ShowRevertChangesAsync(Tree? currentTree, Tree? targetTree)
-    {
-        if (currentTree == null && targetTree == null)
-        {
-            Console.WriteLine("  No changes to revert.");
-            return;
-        }
-
-        if (currentTree == null)
-        {
-            Console.WriteLine("  This will remove all files from the repository.");
-            return;
-        }
-
-        if (targetTree == null)
-        {
-            Console.WriteLine("  This will restore all files to the repository.");
-            return;
-        }
-
-        var changedFiles = new List<string>();
-        var addedFiles = new List<string>();
-        var deletedFiles = new List<string>();
-
-        var currentEntries = currentTree.Entries.ToDictionary(e => e.Name);
-        var targetEntries = targetTree.Entries.ToDictionary(e => e.Name);
-
-        var allNames = currentEntries.Keys.Union(targetEntries.Keys).Distinct();
-
-        foreach (var name in allNames)
-        {
-            bool hasCurrent = currentEntries.ContainsKey(name);
-            bool hasTarget = targetEntries.ContainsKey(name);
-
-            if (hasTarget && !hasCurrent)
-            {
-                // File was added in target commit - will be removed
-                addedFiles.Add(name);
-            }
-            else if (!hasTarget && hasCurrent)
-            {
-                // File was deleted in target commit - will be restored
-                deletedFiles.Add(name);
-            }
-            else if (hasTarget && hasCurrent)
-            {
-                var currentEntry = currentEntries[name];
-                var targetEntry = targetEntries[name];
-
-                if (currentEntry.Hash != targetEntry.Hash)
-                {
-                    if (currentEntry.Type == "blob" && targetEntry.Type == "blob")
-                    {
-                        changedFiles.Add(name);
-                    }
-                    else if (currentEntry.Type == "tree" && targetEntry.Type == "tree")
-                    {
-                        // Recursively check subdirectories
-                        var subCurrent = await _repository!.GetObjectAsync(currentEntry.Hash) as Tree;
-                        var subTarget = await _repository!.GetObjectAsync(targetEntry.Hash) as Tree;
-                        if (subCurrent != null && subTarget != null)
-                        {
-                            var subChanges = await GetTreeDiffAsync(subCurrent, subTarget);
-                            changedFiles.AddRange(subChanges.Select(f => Path.Combine(name, f)));
-                        }
-                    }
-                }
-            }
-        }
-
-        if (addedFiles.Any())
-        {
-            Console.WriteLine($"  \u001b[31m- Files that will be REMOVED: {addedFiles.Count}\u001b[0m");
-            foreach (var file in addedFiles.Take(10))
-                Console.WriteLine($"      {file}");
-            if (addedFiles.Count > 10)
-                Console.WriteLine($"      ... and {addedFiles.Count - 10} more");
-        }
-
-        if (deletedFiles.Any())
-        {
-            Console.WriteLine($"  \u001b[32m+ Files that will be RESTORED: {deletedFiles.Count}\u001b[0m");
-            foreach (var file in deletedFiles.Take(10))
-                Console.WriteLine($"      {file}");
-            if (deletedFiles.Count > 10)
-                Console.WriteLine($"      ... and {deletedFiles.Count - 10} more");
-        }
-
-        if (changedFiles.Any())
-        {
-            Console.WriteLine($"  \u001b[33m✎ Files that will be MODIFIED: {changedFiles.Count}\u001b[0m");
-            foreach (var file in changedFiles.Take(10))
-                Console.WriteLine($"      {file}");
-            if (changedFiles.Count > 10)
-                Console.WriteLine($"      ... and {changedFiles.Count - 10} more");
-        }
-
-        if (!addedFiles.Any() && !deletedFiles.Any() && !changedFiles.Any())
-        {
-            Console.WriteLine("  No changes detected - commit has already been reverted or no effect.");
-        }
-    }
-
-    private static async Task<List<string>> GetTreeDiffAsync(Tree tree1, Tree tree2)
-    {
-        var diff = new List<string>();
-        var dict1 = tree1.Entries.ToDictionary(e => e.Name);
-        var dict2 = tree2.Entries.ToDictionary(e => e.Name);
-
-        foreach (var entry in tree2.Entries)
-        {
-            if (!dict1.ContainsKey(entry.Name) || dict1[entry.Name].Hash != entry.Hash)
-            {
-                if (entry.Type == "blob")
-                {
-                    diff.Add(entry.Name);
-                }
-                else if (entry.Type == "tree")
-                {
-                    var subTree1 = await _repository!.GetObjectAsync(dict1.GetValueOrDefault(entry.Name)?.Hash ?? "") as Tree;
-                    var subTree2 = await _repository!.GetObjectAsync(entry.Hash) as Tree;
-                    if (subTree1 != null && subTree2 != null)
-                    {
-                        var subDiff = await GetTreeDiffAsync(subTree1, subTree2);
-                        diff.AddRange(subDiff.Select(f => Path.Combine(entry.Name, f)));
-                    }
-                }
-            }
-        }
-
-        return diff;
-    }
-
-    private static async Task CollectTreeFilesAsync(Tree tree, string prefix, List<string> files)
-    {
-        foreach (var entry in tree.Entries)
-        {
-            if (entry.Type == "blob")
-            {
-                files.Add(prefix + entry.Name);
-            }
-            else if (entry.Type == "tree")
-            {
-                var subTree = await _repository!.GetObjectAsync(entry.Hash) as Tree;
-                if (subTree != null)
-                {
-                    await CollectTreeFilesAsync(subTree, prefix + entry.Name + "/", files);
-                }
-            }
-        }
-    }
-
     private static void HandleCd(string[] args)
     {
-        // Join all args since they might be part of a quoted path
         var rawPath = string.Join(" ", args);
 
-        // Remove surrounding quotes if present
         if (rawPath.StartsWith("\"") && rawPath.EndsWith("\""))
             rawPath = rawPath[1..^1];
         if (rawPath.StartsWith("'") && rawPath.EndsWith("'"))
@@ -1166,11 +1062,10 @@ internal static class Program
     private static void ShowHelp()
     {
         Console.WriteLine("\n\u001b[36m╔══════════════════════════════════════════════════════════════╗\u001b[0m");
-        Console.WriteLine("\u001b[36m║                    AVAILABLE COMMANDS                        ║\u001b[0m");
+        Console.WriteLine("\u001b[36m║                    AVAILABLE COMMANDS                         ║\u001b[0m");
         Console.WriteLine("\u001b[36m╚══════════════════════════════════════════════════════════════╝\u001b[0m");
         Console.WriteLine();
 
-        // Show commands based on user role
         Console.WriteLine($"\u001b[33mYour Role: {_currentUserRole}\u001b[0m");
         Console.WriteLine();
 
@@ -1178,12 +1073,12 @@ internal static class Program
         if (_currentUserRole >= UserRole.User)
         {
             Console.WriteLine("\u001b[33mBasic Commands:\u001b[0m");
-            Console.WriteLine($"  {"commit, c [files...]",-35} - Commit changes (specific files optional)");
-            Console.WriteLine($"  {"revert, rv <hash> [message]",-35} - Revert a previous commit");
-            Console.WriteLine($"  {"status, s",-35} - Show working directory status");
-            Console.WriteLine($"  {"log, l",-35} - Show commit history");
-            Console.WriteLine($"  {"diff, d <c1> <c2>",-35} - Show diff between commits");
-            Console.WriteLine($"  {"verify, v",-35} - Verify repository integrity");
+            Console.WriteLine($"  {"commit, c [files...]",-38} - Commit changes (specific files optional)");
+            Console.WriteLine($"  {"status, s",-38} - Show working directory status");
+            Console.WriteLine($"  {"log, l",-38} - Show commit history");
+            Console.WriteLine($"  {"diff, d <c1> <c2>",-38} - Show diff between commits");
+            Console.WriteLine($"  {"verify, v",-38} - Verify repository integrity");
+            Console.WriteLine($"  {"revert, rv <hash> [msg]",-38} - Revert a previous commit");
             Console.WriteLine();
         }
 
@@ -1191,8 +1086,8 @@ internal static class Program
         if (_currentUserRole >= UserRole.Developer)
         {
             Console.WriteLine("\u001b[33mBranch Commands:\u001b[0m");
-            Console.WriteLine($"  {"branch, b [name]",-35} - List or create branches");
-            Console.WriteLine($"  {"checkout, co <branch>",-35} - Switch branches");
+            Console.WriteLine($"  {"branch, b [name]",-38} - List or create branches");
+            Console.WriteLine($"  {"checkout, co <branch>",-38} - Switch branches");
             Console.WriteLine();
         }
 
@@ -1200,36 +1095,38 @@ internal static class Program
         if (_currentUserRole >= UserRole.Maintainer)
         {
             Console.WriteLine("\u001b[33mMaintainer Commands:\u001b[0m");
-            Console.WriteLine($"  {"delete-branch, db <branch>",-35} - Delete a branch");
+            Console.WriteLine($"  {"delete-branch, db <branch>",-38} - Delete a branch");
             Console.WriteLine();
         }
 
         // File System Commands (Everyone)
         Console.WriteLine("\u001b[33mFile System Commands:\u001b[0m");
-        Console.WriteLine($"  {"dir, ls [path] [/a] [/l]",-35} - List directory contents");
-        Console.WriteLine($"      {"",-35} /a, -a, --all - Show hidden files");
-        Console.WriteLine($"      {"",-35} /l, -l, --long - Show detailed view");
-        Console.WriteLine($"  {"cd <path>",-35} - Change directory (supports quoted paths with spaces)");
-        Console.WriteLine($"  {"pwd",-35} - Print working directory");
+        Console.WriteLine($"  {"dir, ls [path] [/a] [/l]",-38} - List directory contents");
+        Console.WriteLine($"      {"",-38} /a, -a, --all - Show hidden files");
+        Console.WriteLine($"      {"",-38} /l, -l, --long - Show detailed view");
+        Console.WriteLine($"  {"cd <path>",-38} - Change directory (supports quoted paths with spaces)");
+        Console.WriteLine($"  {"pwd",-38} - Print working directory");
         Console.WriteLine();
 
         // Admin Commands
         if (_currentUserRole >= UserRole.Admin)
         {
             Console.WriteLine("\u001b[33mAdmin Commands:\u001b[0m");
-            Console.WriteLine($"  {"users, u",-35} - Manage users");
-            Console.WriteLine($"  {"users add <user> <pass> <email> [role]",-35} - Create new user");
-            Console.WriteLine($"  {"users delete <username>",-35} - Delete a user");
+            Console.WriteLine($"  {"users, u",-38} - Manage users");
+            Console.WriteLine($"  {"users add <user> <pass> <email> [role]",-38} - Create new user");
+            Console.WriteLine($"  {"users delete <username>",-38} - Delete a user");
+            Console.WriteLine($"  {"grant <username> <repo>",-38} - Grant user access to a repository");
             Console.WriteLine();
         }
 
         // Session Commands (Everyone)
         Console.WriteLine("\u001b[33mSession Commands:\u001b[0m");
-        Console.WriteLine($"  {"whoami",-35} - Show current user info");
-        Console.WriteLine($"  {"logout",-35} - Log out current user");
-        Console.WriteLine($"  {"info, repo-info",-35} - Show repository information");
-        Console.WriteLine($"  {"help, h, ?",-35} - Show this help");
-        Console.WriteLine($"  {"exit, quit, q",-35} - Exit the application");
+        Console.WriteLine($"  {"whoami",-38} - Show current user info");
+        Console.WriteLine($"  {"permissions, perms",-38} - Show your current permissions");
+        Console.WriteLine($"  {"logout",-38} - Log out current user");
+        Console.WriteLine($"  {"info, repo-info",-38} - Show repository information");
+        Console.WriteLine($"  {"help, h, ?",-38} - Show this help");
+        Console.WriteLine($"  {"exit, quit, q",-38} - Exit the application");
         Console.WriteLine();
 
         Console.WriteLine("\u001b[36mExamples:\u001b[0m");
@@ -1239,17 +1136,20 @@ internal static class Program
         Console.WriteLine($"  \u001b[36m> commit \"Fix bug\"\u001b[0m");
         Console.WriteLine($"  \u001b[36m> branch feature\u001b[0m");
         Console.WriteLine($"  \u001b[36m> checkout feature\u001b[0m");
+        Console.WriteLine($"  \u001b[36m> revert abc123\u001b[0m");
+        Console.WriteLine($"  \u001b[36m> diff abc123 def456\u001b[0m");
 
         if (_currentUserRole >= UserRole.Admin)
         {
             Console.WriteLine($"  \u001b[36m> users add john pass123 john@example.com developer\u001b[0m");
+            Console.WriteLine($"  \u001b[36m> grant john myrepo\u001b[0m");
         }
 
         Console.WriteLine();
         Console.WriteLine("\u001b[33mRole Indicators:\u001b[0m");
         Console.WriteLine($"  👑 - Admin (full access)");
         Console.WriteLine($"  ⭐ - Maintainer (can delete branches)");
-        Console.WriteLine($"  🔧 - Developer (can create branches)");
+        Console.WriteLine($"  🔧 - Developer (can create branches, revert commits)");
         Console.WriteLine($"  👤 - User (can commit, view)");
         Console.WriteLine($"  👁️ - Guest (view only)");
     }

@@ -24,6 +24,10 @@ public sealed class GitRepository : IAsyncDisposable
         _gitDirectory = Path.Combine(workingDirectory, ".gitclone");
         _repositoryName = Path.GetFileName(workingDirectory);
 
+        // Debug output
+        Console.WriteLine($"Repository Name: '{_repositoryName}'");
+        Console.WriteLine($"Working Directory: '{_workingDirectory}'");
+
         _objectStore = new ObjectStore(_gitDirectory);
         _referenceManager = new ReferenceManager(_gitDirectory);
         _treeBuilder = new TreeBuilder(_objectStore);
@@ -68,11 +72,8 @@ public sealed class GitRepository : IAsyncDisposable
 
             if (!string.IsNullOrEmpty(emptyTree.Hash) && emptyTree.Hash != "empty")
             {
-                Console.WriteLine($"  ✓ Empty tree created: {emptyTree.Hash[..Math.Min(8, emptyTree.Hash.Length)]}");
-            }
-            else
-            {
-                Console.WriteLine($"  ⚠ Empty tree created with hash: {emptyTree.Hash}");
+                var shortHash = emptyTree.Hash.Length >= 8 ? emptyTree.Hash[..8] : emptyTree.Hash;
+                Console.WriteLine($"  ✓ Empty tree created: {shortHash}");
             }
 
             // Create initial commit
@@ -82,11 +83,8 @@ public sealed class GitRepository : IAsyncDisposable
 
             if (!string.IsNullOrEmpty(initialCommit.Hash) && initialCommit.Hash != "empty")
             {
-                Console.WriteLine($"  ✓ Initial commit created: {initialCommit.Hash[..Math.Min(8, initialCommit.Hash.Length)]}");
-            }
-            else
-            {
-                Console.WriteLine($"  ⚠ Initial commit created with hash: {initialCommit.Hash}");
+                var shortHash = initialCommit.Hash.Length >= 8 ? initialCommit.Hash[..8] : initialCommit.Hash;
+                Console.WriteLine($"  ✓ Initial commit created: {shortHash}");
             }
 
             // Update main branch reference
@@ -105,7 +103,6 @@ public sealed class GitRepository : IAsyncDisposable
         catch (Exception ex)
         {
             Console.WriteLine($"  ✗ Error during initialization: {ex.Message}");
-            Console.WriteLine($"  Stack trace: {ex.StackTrace}");
             throw;
         }
     }
@@ -118,7 +115,7 @@ public sealed class GitRepository : IAsyncDisposable
             if (!string.IsNullOrEmpty(currentCommit))
             {
                 var shortHash = currentCommit.Length >= 8 ? currentCommit[..8] : currentCommit;
-                Console.WriteLine($"✓ Repository verified with commit: {shortHash}...");
+                Console.WriteLine($"✓ Repository verified with commit: {shortHash}");
             }
             else
             {
@@ -159,20 +156,77 @@ public sealed class GitRepository : IAsyncDisposable
     // Authorization checks
     private bool HasPermission(Permission required)
     {
-        return _authService.HasPermission(required);
+        if (!IsAuthenticated())
+            return false;
+
+        var user = GetCurrentUser();
+        if (user == null) return false;
+
+        var userPermissions = PermissionHelper.GetPermissionsForRole(user.Role);
+        return PermissionHelper.HasPermission(userPermissions, required);
     }
 
     private bool HasRepositoryAccess(Permission required)
     {
-        return _authService.HasRepositoryAccess(_repositoryName, required);
+        if (!IsAuthenticated())
+            return false;
+
+        var user = GetCurrentUser();
+        if (user == null) return false;
+
+        // Debug output
+        Console.WriteLine($"Checking repository access: User={user.Username}, Role={user.Role}, Repo={_repositoryName}, Required={required}");
+
+        // Get user's role-based permissions
+        var userPermissions = PermissionHelper.GetPermissionsForRole(user.Role);
+
+        // Admin has access to everything
+        if (user.Role == UserRole.Admin)
+        {
+            Console.WriteLine($"Admin access granted for {user.Username}");
+            return PermissionHelper.HasPermission(userPermissions, required);
+        }
+
+        // If user has no repository restrictions, allow access
+        if (user.AllowedRepositories == null || user.AllowedRepositories.Count == 0)
+        {
+            Console.WriteLine($"No repository restrictions for {user.Username}, allowing access");
+            return PermissionHelper.HasPermission(userPermissions, required);
+        }
+
+        // Check if user has access to this specific repository
+        bool hasRepoAccess = user.AllowedRepositories.Contains(_repositoryName) ||
+                             user.AllowedRepositories.Contains("*");
+
+        if (!hasRepoAccess)
+        {
+            Console.WriteLine($"User {user.Username} does not have access to repository '{_repositoryName}'");
+            Console.WriteLine($"Allowed repositories: {string.Join(", ", user.AllowedRepositories)}");
+            return false;
+        }
+
+        // Check if the user's role has the required permission
+        var result = PermissionHelper.HasPermission(userPermissions, required);
+        Console.WriteLine($"Permission check result: {result}");
+        return result;
     }
+
 
     private void CheckAuthorization(Permission required)
     {
         if (_activeToken == null || !_sessionManager.ValidateSession(_activeToken))
             throw new UnauthorizedAccessException("Session invalid or expired");
+
         if (!HasRepositoryAccess(required))
-            throw new UnauthorizedAccessException($"Insufficient permissions. Required: {required}");
+        {
+            var user = GetCurrentUser();
+            var role = user?.Role ?? UserRole.Guest;
+            var userPermissions = PermissionHelper.GetPermissionsForRole(role);
+
+            throw new UnauthorizedAccessException(
+                $"Insufficient permissions. Required: {required}. " +
+                $"Your role ({role}) has: {PermissionHelper.GetPermissionString(userPermissions)}");
+        }
     }
 
     // Restore tree helper for checkout
@@ -195,19 +249,15 @@ public sealed class GitRepository : IAsyncDisposable
                 var blob = await _objectStore.GetObjectAsync(entry.Hash) as Blob;
                 if (blob != null && blob.Data != null)
                 {
-                    // Ensure directory exists
                     var fileDir = Path.GetDirectoryName(fullPath);
                     if (!string.IsNullOrEmpty(fileDir) && !Directory.Exists(fileDir))
                         Directory.CreateDirectory(fileDir);
 
-                    // Write the file content
                     await File.WriteAllBytesAsync(fullPath, blob.Data);
-                    Console.WriteLine($"  Restored: {entry.Name}");
                 }
             }
             else if (entry.Type == "tree")
             {
-                // Create directory and recurse
                 if (!Directory.Exists(fullPath))
                     Directory.CreateDirectory(fullPath);
                 await RestoreTreeAsync(entry.Hash, fullPath);
@@ -222,7 +272,6 @@ public sealed class GitRepository : IAsyncDisposable
 
         foreach (var file in Directory.GetFiles(dir))
         {
-            // Skip .gitclone directory
             if (file.Contains(".gitclone")) continue;
 
             try
@@ -237,7 +286,6 @@ public sealed class GitRepository : IAsyncDisposable
 
         foreach (var subDir in Directory.GetDirectories(dir))
         {
-            // Skip .gitclone directory
             if (subDir.Contains(".gitclone")) continue;
 
             try
@@ -254,7 +302,21 @@ public sealed class GitRepository : IAsyncDisposable
     // Commit methods
     public async Task<string> CommitAsync(string message, string author)
     {
-        CheckAuthorization(Permission.Commit);
+        if (!HasPermission(Permission.Commit))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to commit. " +
+                $"Required: {Permission.Commit}");
+        }
+
+        if (!HasRepositoryAccess(Permission.Commit))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"You don't have commit access to repository '{_repositoryName}'. " +
+                $"Your role: {user?.Role}");
+        }
 
         Console.WriteLine("Creating tree from working directory...");
         var currentTree = await _treeBuilder.CreateTreeFromDirectoryAsync(_workingDirectory);
@@ -274,15 +336,29 @@ public sealed class GitRepository : IAsyncDisposable
 
     public async Task<string> CommitFilesAsync(string message, string author, params string[] filePaths)
     {
-        CheckAuthorization(Permission.Commit);
+        if (!HasPermission(Permission.Commit))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to commit. " +
+                $"Required: {Permission.Commit}");
+        }
+
+        if (!HasRepositoryAccess(Permission.Commit))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"You don't have commit access to repository '{_repositoryName}'. " +
+                $"Your role: {user?.Role}");
+        }
 
         var parentHash = _referenceManager.GetCurrentCommit();
         Tree? baseTree = null;
 
-        if (parentHash != null)
+        if (!string.IsNullOrEmpty(parentHash))
         {
             var parentCommit = await _objectStore.GetObjectAsync(parentHash) as Commit;
-            if (parentCommit != null)
+            if (parentCommit != null && !string.IsNullOrEmpty(parentCommit.TreeHash))
             {
                 baseTree = await _objectStore.GetObjectAsync(parentCommit.TreeHash) as Tree;
             }
@@ -295,6 +371,9 @@ public sealed class GitRepository : IAsyncDisposable
         await _objectStore.StoreObjectAsync(commit);
 
         _referenceManager.UpdateCurrentBranch(commit.Hash);
+
+        var shortHash = commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
+        Console.WriteLine($"✓ Commit created: {shortHash}...");
 
         return commit.Hash;
     }
@@ -309,125 +388,150 @@ public sealed class GitRepository : IAsyncDisposable
         return CommitFilesAsync(message, author, filePaths).GetAwaiter().GetResult();
     }
 
-    // Revert methods - FIXED VERSION
+    // Revert methods
+    private string? GetFullHash(string shortHash)
+    {
+        if (string.IsNullOrEmpty(shortHash))
+            return null;
+
+        if (shortHash.Length == 64)
+            return shortHash;
+
+        var history = GetCommitHistory();
+        foreach (var commit in history)
+        {
+            if (!string.IsNullOrEmpty(commit.Hash))
+            {
+                if (commit.Hash.Equals(shortHash, StringComparison.OrdinalIgnoreCase) ||
+                    commit.Hash.StartsWith(shortHash, StringComparison.OrdinalIgnoreCase))
+                {
+                    return commit.Hash;
+                }
+            }
+        }
+
+        return null;
+    }
+
     public async Task<string> RevertCommitAsync(string commitHash, string author, string? customMessage = null)
     {
-        CheckAuthorization(Permission.Commit);
+        if (!HasPermission(Permission.Commit))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to revert commits. " +
+                $"Required: {Permission.Commit}");
+        }
 
-        // Get the commit to revert
-        var commitToRevert = await _objectStore.GetObjectAsync(commitHash) as Commit;
-        if (commitToRevert == null)
+        if (string.IsNullOrEmpty(commitHash))
+        {
+            throw new ArgumentException("Commit hash cannot be empty");
+        }
+
+        var fullHash = GetFullHash(commitHash);
+        if (string.IsNullOrEmpty(fullHash))
         {
             throw new ArgumentException($"Commit not found: {commitHash}");
         }
 
-        // Get the parent of the commit to revert (the state before that commit)
-        Tree? parentTree = null;
-        if (!string.IsNullOrEmpty(commitToRevert.ParentHash))
+        var commitToRevert = await _objectStore.GetObjectAsync(fullHash) as Commit;
+        if (commitToRevert == null)
         {
-            var parentCommit = await _objectStore.GetObjectAsync(commitToRevert.ParentHash) as Commit;
-            if (parentCommit != null)
-            {
-                parentTree = await _objectStore.GetObjectAsync(parentCommit.TreeHash) as Tree;
-            }
+            throw new ArgumentException($"Commit not found: {fullHash}");
         }
 
-        // Get the current tree (HEAD)
         var currentCommitHash = _referenceManager.GetCurrentCommit();
         Tree? currentTree = null;
-        if (currentCommitHash != null)
+
+        if (!string.IsNullOrEmpty(currentCommitHash))
         {
             var currentCommit = await _objectStore.GetObjectAsync(currentCommitHash) as Commit;
-            if (currentCommit != null)
+            if (currentCommit != null && !string.IsNullOrEmpty(currentCommit.TreeHash))
             {
                 currentTree = await _objectStore.GetObjectAsync(currentCommit.TreeHash) as Tree;
             }
         }
 
-        // Get the tree from the commit to revert (the changes we want to undo)
+        Tree? parentTree = null;
+        if (!string.IsNullOrEmpty(commitToRevert.ParentHash))
+        {
+            var parentCommit = await _objectStore.GetObjectAsync(commitToRevert.ParentHash) as Commit;
+            if (parentCommit != null && !string.IsNullOrEmpty(parentCommit.TreeHash))
+            {
+                parentTree = await _objectStore.GetObjectAsync(parentCommit.TreeHash) as Tree;
+            }
+        }
+
         var revertTargetTree = await _objectStore.GetObjectAsync(commitToRevert.TreeHash) as Tree;
         if (revertTargetTree == null)
         {
             throw new InvalidOperationException("Cannot find tree for the commit to revert");
         }
 
-        // Create a new tree that applies the reverse changes to the current tree
         Tree revertTree;
         if (parentTree != null)
         {
-            // Calculate the diff between parent and target, then apply reverse to current
             revertTree = await ApplyReverseChangesAsync(currentTree, parentTree, revertTargetTree);
         }
         else
         {
-            // Initial commit - revert means remove all files added in that commit
             revertTree = await RemoveAddedFilesAsync(currentTree, revertTargetTree);
         }
 
-        // Store the new tree
         await _objectStore.StoreObjectAsync(revertTree);
 
-        // Create the revert commit
-        var message = customMessage ?? $"Revert commit: {commitHash[..8]} - {commitToRevert.Message}";
+        var shortHash = fullHash.Length >= 8 ? fullHash[..8] : fullHash;
+        var message = customMessage ?? $"Revert commit: {shortHash} - {commitToRevert.Message}";
         var revertCommit = new Commit(revertTree.Hash, currentCommitHash, author, message, DateTime.UtcNow);
         await _objectStore.StoreObjectAsync(revertCommit);
 
-        // Update current branch
         _referenceManager.UpdateCurrentBranch(revertCommit.Hash);
 
-        // Update working directory with reverted files
         Console.WriteLine("Updating working directory with reverted changes...");
         await RestoreTreeAsync(revertTree.Hash, _workingDirectory);
 
         return revertCommit.Hash;
     }
 
-    public string RevertCommit(string commitHash, string author, string? customMessage = null)
-    {
-        return RevertCommitAsync(commitHash, author, customMessage).GetAwaiter().GetResult();
-    }
-
-    // Helper method to apply reverse changes
     private async Task<Tree> ApplyReverseChangesAsync(Tree? currentTree, Tree parentTree, Tree targetTree)
     {
         var entries = new List<TreeEntry>();
 
-        // Start with current tree entries if it exists
-        if (currentTree != null)
+        if (currentTree != null && currentTree.Entries != null)
         {
             foreach (var entry in currentTree.Entries)
             {
-                entries.Add(new TreeEntry
+                if (entry != null)
                 {
-                    Mode = entry.Mode,
-                    Name = entry.Name,
-                    Hash = entry.Hash,
-                    Type = entry.Type
-                });
+                    entries.Add(new TreeEntry
+                    {
+                        Mode = entry.Mode,
+                        Name = entry.Name,
+                        Hash = entry.Hash,
+                        Type = entry.Type
+                    });
+                }
             }
         }
 
-        // Get the diff between parent and target (changes made in the commit to revert)
         var parentEntries = parentTree.Entries.ToDictionary(e => e.Name);
         var targetEntries = targetTree.Entries.ToDictionary(e => e.Name);
 
-        // For each file that changed in the commit to revert, reverse the change
         foreach (var targetEntry in targetTree.Entries)
         {
+            if (targetEntry == null) continue;
+
             bool existedInParent = parentEntries.ContainsKey(targetEntry.Name);
 
             if (!existedInParent)
             {
-                // File was ADDED in the commit to revert - remove it from current
                 entries.RemoveAll(e => e.Name == targetEntry.Name);
-                Console.WriteLine($"  Will remove: {targetEntry.Name}");
             }
             else
             {
                 var parentEntry = parentEntries[targetEntry.Name];
                 if (parentEntry.Hash != targetEntry.Hash)
                 {
-                    // File was MODIFIED in the commit to revert - revert to parent version
                     if (parentEntry.Type == "blob")
                     {
                         entries.RemoveAll(e => e.Name == parentEntry.Name);
@@ -438,11 +542,9 @@ public sealed class GitRepository : IAsyncDisposable
                             Hash = parentEntry.Hash,
                             Type = parentEntry.Type
                         });
-                        Console.WriteLine($"  Will revert: {parentEntry.Name} to previous version");
                     }
                     else if (parentEntry.Type == "tree")
                     {
-                        // Handle directory changes recursively
                         var parentSubTree = await _objectStore.GetObjectAsync(parentEntry.Hash) as Tree;
                         var targetSubTree = await _objectStore.GetObjectAsync(targetEntry.Hash) as Tree;
 
@@ -469,12 +571,12 @@ public sealed class GitRepository : IAsyncDisposable
             }
         }
 
-        // Check for files DELETED in the commit to revert - restore them
         foreach (var parentEntry in parentTree.Entries)
         {
+            if (parentEntry == null) continue;
+
             if (!targetEntries.ContainsKey(parentEntry.Name))
             {
-                // File was DELETED in the commit to revert - restore it
                 if (!entries.Any(e => e.Name == parentEntry.Name))
                 {
                     entries.Add(new TreeEntry
@@ -484,12 +586,10 @@ public sealed class GitRepository : IAsyncDisposable
                         Hash = parentEntry.Hash,
                         Type = parentEntry.Type
                     });
-                    Console.WriteLine($"  Will restore: {parentEntry.Name}");
                 }
             }
         }
 
-        // Create the new tree
         var newTree = new Tree();
         foreach (var entry in entries.OrderBy(e => e.Name))
         {
@@ -500,18 +600,15 @@ public sealed class GitRepository : IAsyncDisposable
         return newTree;
     }
 
-    // Helper method for reverting initial commit
     private async Task<Tree> RemoveAddedFilesAsync(Tree? currentTree, Tree targetTree)
     {
         var entries = new List<TreeEntry>();
 
-        // Start with current tree entries if it exists
-        if (currentTree != null)
+        if (currentTree != null && currentTree.Entries != null)
         {
             foreach (var entry in currentTree.Entries)
             {
-                // Only keep entries that were not added in the target commit
-                if (!targetTree.Entries.Any(e => e.Name == entry.Name))
+                if (entry != null && !targetTree.Entries.Any(e => e.Name == entry.Name))
                 {
                     entries.Add(new TreeEntry
                     {
@@ -520,10 +617,6 @@ public sealed class GitRepository : IAsyncDisposable
                         Hash = entry.Hash,
                         Type = entry.Type
                     });
-                }
-                else
-                {
-                    Console.WriteLine($"  Will remove: {entry.Name}");
                 }
             }
         }
@@ -536,6 +629,73 @@ public sealed class GitRepository : IAsyncDisposable
         newTree.Hash = newTree.ComputeHash();
 
         return newTree;
+    }
+
+    public async Task ShowRevertChangesAsync(string commitHash)
+    {
+        var fullHash = GetFullHash(commitHash);
+        if (string.IsNullOrEmpty(fullHash))
+        {
+            Console.WriteLine($"Commit not found: {commitHash}");
+            return;
+        }
+
+        var commitToRevert = await _objectStore.GetObjectAsync(fullHash) as Commit;
+        if (commitToRevert == null)
+        {
+            Console.WriteLine($"Commit not found: {fullHash}");
+            return;
+        }
+
+        Tree? parentTree = null;
+        if (!string.IsNullOrEmpty(commitToRevert.ParentHash))
+        {
+            var parentCommit = await _objectStore.GetObjectAsync(commitToRevert.ParentHash) as Commit;
+            if (parentCommit != null)
+            {
+                parentTree = await _objectStore.GetObjectAsync(parentCommit.TreeHash) as Tree;
+            }
+        }
+
+        var targetTree = await _objectStore.GetObjectAsync(commitToRevert.TreeHash) as Tree;
+
+        Console.WriteLine($"\n\u001b[36mChanges that will be reverted:\u001b[0m");
+
+        if (parentTree != null && targetTree != null)
+        {
+            var parentEntries = parentTree.Entries.ToDictionary(e => e.Name);
+            var targetEntries = targetTree.Entries.ToDictionary(e => e.Name);
+
+            foreach (var targetEntry in targetTree.Entries)
+            {
+                if (targetEntry == null) continue;
+
+                bool existedInParent = parentEntries.ContainsKey(targetEntry.Name);
+
+                if (!existedInParent)
+                {
+                    Console.WriteLine($"  \u001b[31m- File will be REMOVED: {targetEntry.Name}\u001b[0m");
+                }
+                else
+                {
+                    var parentEntry = parentEntries[targetEntry.Name];
+                    if (parentEntry.Hash != targetEntry.Hash)
+                    {
+                        Console.WriteLine($"  \u001b[33m✎ File will be REVERTED: {targetEntry.Name}\u001b[0m");
+                    }
+                }
+            }
+
+            foreach (var parentEntry in parentTree.Entries)
+            {
+                if (parentEntry == null) continue;
+
+                if (!targetEntries.ContainsKey(parentEntry.Name))
+                {
+                    Console.WriteLine($"  \u001b[32m+ File will be RESTORED: {parentEntry.Name}\u001b[0m");
+                }
+            }
+        }
     }
 
     // Status methods
@@ -560,13 +720,10 @@ public sealed class GitRepository : IAsyncDisposable
                 var workingTree = await _treeBuilder.CreateTreeFromDirectoryAsync(_workingDirectory);
 
                 status = await _diffService.GetStatusAsync(currentTree, workingTree);
-
-                // Collect all tracked paths from the committed tree
                 await CollectTreePathsAsync(currentTree, "", trackedPaths);
             }
         }
 
-        // Check for untracked files
         var allFiles = new List<string>();
         if (Directory.Exists(_workingDirectory))
         {
@@ -657,11 +814,69 @@ public sealed class GitRepository : IAsyncDisposable
     }
 
     // Diff methods
-    public void Diff(string commitHash1, string commitHash2) =>
-        _diffService.DiffCommits(commitHash1, commitHash2);
+    public void Diff(string commitHash1, string commitHash2)
+    {
+        if (!HasRepositoryAccess(Permission.Read))
+        {
+            Console.WriteLine("Insufficient permissions to read commits");
+            return;
+        }
 
-    public async Task DiffAsync(string commitHash1, string commitHash2) =>
-        await _diffService.DiffCommitsAsync(commitHash1, commitHash2);
+        if (string.IsNullOrEmpty(commitHash1) || string.IsNullOrEmpty(commitHash2))
+        {
+            Console.WriteLine("Invalid commit hashes provided");
+            return;
+        }
+
+        var fullHash1 = GetFullHash(commitHash1);
+        var fullHash2 = GetFullHash(commitHash2);
+
+        if (string.IsNullOrEmpty(fullHash1))
+        {
+            Console.WriteLine($"Commit not found: {commitHash1}");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(fullHash2))
+        {
+            Console.WriteLine($"Commit not found: {commitHash2}");
+            return;
+        }
+
+        _diffService.DiffCommits(fullHash1, fullHash2);
+    }
+
+    public async Task DiffAsync(string commitHash1, string commitHash2)
+    {
+        if (!HasRepositoryAccess(Permission.Read))
+        {
+            Console.WriteLine("Insufficient permissions to read commits");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(commitHash1) || string.IsNullOrEmpty(commitHash2))
+        {
+            Console.WriteLine("Invalid commit hashes provided");
+            return;
+        }
+
+        var fullHash1 = GetFullHash(commitHash1);
+        var fullHash2 = GetFullHash(commitHash2);
+
+        if (string.IsNullOrEmpty(fullHash1))
+        {
+            Console.WriteLine($"Commit not found: {commitHash1}");
+            return;
+        }
+
+        if (string.IsNullOrEmpty(fullHash2))
+        {
+            Console.WriteLine($"Commit not found: {commitHash2}");
+            return;
+        }
+
+        await _diffService.DiffCommitsAsync(fullHash1, fullHash2);
+    }
 
     // Branch methods
     public List<string> GetAllBranches()
@@ -682,7 +897,13 @@ public sealed class GitRepository : IAsyncDisposable
 
     public void CreateBranch(string branchName)
     {
-        CheckAuthorization(Permission.CreateBranch);
+        if (!HasPermission(Permission.CreateBranch))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to create branches. " +
+                $"Required: {Permission.CreateBranch}");
+        }
 
         var currentCommit = _referenceManager.GetCurrentCommit();
         if (!string.IsNullOrEmpty(currentCommit))
@@ -699,7 +920,13 @@ public sealed class GitRepository : IAsyncDisposable
 
     public async Task<bool> CheckoutAsync(string branchName)
     {
-        CheckAuthorization(Permission.Read);
+        if (!HasPermission(Permission.Read))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to checkout branches. " +
+                $"Required: {Permission.Read}");
+        }
 
         var branchRef = $"refs/heads/{branchName}";
         var commitHash = _referenceManager.GetReference(branchRef);
@@ -714,7 +941,6 @@ public sealed class GitRepository : IAsyncDisposable
         Console.WriteLine($"Switching to branch '{branchName}'...");
         Console.WriteLine($"Commit: {shortHash}...");
 
-        // Get the commit and its tree
         var commit = await _objectStore.GetObjectAsync(commitHash) as Commit;
         if (commit is null)
         {
@@ -722,21 +948,17 @@ public sealed class GitRepository : IAsyncDisposable
             return false;
         }
 
-        // Clear current working directory
         Console.WriteLine("Clearing working directory...");
         ClearWorkingDirectory(_workingDirectory);
 
-        // Restore files from the commit's tree
         Console.WriteLine("Restoring files from commit...");
         await RestoreTreeAsync(commit.TreeHash, _workingDirectory);
 
-        // Update HEAD
         _referenceManager.SetHead(branchRef);
 
         Console.WriteLine($"\u001b[32m✓ Switched to branch '{branchName}'\u001b[0m");
         return true;
     }
-
 
     public bool Checkout(string branchName)
     {
@@ -745,7 +967,13 @@ public sealed class GitRepository : IAsyncDisposable
 
     public bool DeleteBranch(string branchName)
     {
-        CheckAuthorization(Permission.DeleteBranch);
+        if (!HasPermission(Permission.DeleteBranch))
+        {
+            var user = GetCurrentUser();
+            throw new UnauthorizedAccessException(
+                $"Your role ({user?.Role}) does not have permission to delete branches. " +
+                $"Required: {Permission.DeleteBranch}");
+        }
 
         if (branchName == "main")
         {
@@ -797,6 +1025,14 @@ public sealed class GitRepository : IAsyncDisposable
         return _authService.Register(username, password, email, role);
     }
 
+    public bool RegisterUserWithRepository(string username, string password, string email, string repositoryName, UserRole role = UserRole.User)
+    {
+        if (!HasPermission(Permission.ManageUsers))
+            throw new UnauthorizedAccessException("Admin privileges required");
+
+        return _authService.RegisterUserWithRepository(username, password, email, repositoryName, role);
+    }
+
     public bool DeleteUser(string username)
     {
         if (!HasPermission(Permission.ManageUsers))
@@ -827,6 +1063,12 @@ public sealed class GitRepository : IAsyncDisposable
             throw new UnauthorizedAccessException("Admin privileges required");
 
         _authService.GrantRepositoryAccess(username, repositoryName);
+        Console.WriteLine($"\u001b[32m✓ User '{username}' granted access to repository '{repositoryName}'\u001b[0m");
+    }
+
+    public void GrantUserRepositoryAccess(string username, string repositoryName)
+    {
+        GrantRepositoryAccess(username, repositoryName);
     }
 
     // Utility methods
@@ -839,7 +1081,31 @@ public sealed class GitRepository : IAsyncDisposable
         var user = GetCurrentUser();
         if (user == null) return "Not logged in";
 
-        return $"User: {user.Username} | Role: {user.Role} | Email: {user.Email}";
+        var permissions = PermissionHelper.GetPermissionsForRole(user.Role);
+        return $"User: {user.Username} | Role: {user.Role} | Email: {user.Email} | Permissions: {PermissionHelper.GetPermissionString(permissions)}";
+    }
+
+    public void ShowMyPermissions()
+    {
+        if (!IsAuthenticated())
+        {
+            Console.WriteLine("Not logged in");
+            return;
+        }
+
+        var user = GetCurrentUser();
+        if (user == null) return;
+
+        var permissions = PermissionHelper.GetPermissionsForRole(user.Role);
+        Console.WriteLine($"\u001b[36mYour permissions ({user.Role}):\u001b[0m");
+        Console.WriteLine($"  {PermissionHelper.GetPermissionString(permissions)}");
+        Console.WriteLine($"\u001b[36mRepository access:\u001b[0m");
+        if (user.AllowedRepositories.Contains("*"))
+            Console.WriteLine($"  All repositories");
+        else if (user.AllowedRepositories.Any())
+            Console.WriteLine($"  {string.Join(", ", user.AllowedRepositories)}");
+        else
+            Console.WriteLine($"  No specific repository access (contact admin)");
     }
 
     public void Log()
@@ -878,7 +1144,7 @@ public sealed class GitRepository : IAsyncDisposable
 
         foreach (var commit in history)
         {
-            var shortHash = commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
+            var shortHash = !string.IsNullOrEmpty(commit.Hash) && commit.Hash.Length >= 8 ? commit.Hash[..8] : commit.Hash;
             Console.WriteLine($"\u001b[33mcommit {shortHash}\u001b[0m");
             Console.WriteLine($"Author: {commit.Author}");
             Console.WriteLine($"Date:   {commit.Timestamp:yyyy-MM-dd HH:mm:ss}");
@@ -890,10 +1156,10 @@ public sealed class GitRepository : IAsyncDisposable
     {
         Console.WriteLine("\n\u001b[36mRepository Information:\u001b[0m");
         Console.WriteLine(new string('-', 50));
+        Console.WriteLine($"Repository name: {_repositoryName}");
         Console.WriteLine($"Git directory: {_gitDirectory}");
         Console.WriteLine($"Working directory: {_workingDirectory}");
 
-        // Show HEAD
         var headPath = Path.Combine(_gitDirectory, "HEAD");
         if (File.Exists(headPath))
         {
@@ -905,7 +1171,6 @@ public sealed class GitRepository : IAsyncDisposable
             Console.WriteLine($"HEAD: \u001b[31mNOT FOUND\u001b[0m");
         }
 
-        // Show branches
         var branches = GetAllBranches();
         if (branches.Any())
         {
@@ -917,7 +1182,6 @@ public sealed class GitRepository : IAsyncDisposable
         }
         Console.WriteLine($"Current branch: {GetCurrentBranch() ?? "detached"}");
 
-        // Show current commit
         var currentCommit = _referenceManager.GetCurrentCommit();
         if (!string.IsNullOrEmpty(currentCommit))
         {
@@ -937,7 +1201,6 @@ public sealed class GitRepository : IAsyncDisposable
             Console.WriteLine($"Current commit: \u001b[33mNone\u001b[0m");
         }
 
-        // Show object count
         var objectsPath = Path.Combine(_gitDirectory, "objects");
         if (Directory.Exists(objectsPath))
         {

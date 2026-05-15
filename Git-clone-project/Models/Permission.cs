@@ -37,4 +37,21 @@ public static class PermissionHelper
     {
         return (userPermissions & required) == required;
     }
+
+    public static string GetPermissionString(Permission permission)
+    {
+        var permissions = new List<string>();
+        if ((permission & Permission.Read) != 0) permissions.Add("Read");
+        if ((permission & Permission.Write) != 0) permissions.Add("Write");
+        if ((permission & Permission.Commit) != 0) permissions.Add("Commit");
+        if ((permission & Permission.CreateBranch) != 0) permissions.Add("CreateBranch");
+        if ((permission & Permission.DeleteBranch) != 0) permissions.Add("DeleteBranch");
+        if ((permission & Permission.Merge) != 0) permissions.Add("Merge");
+        if ((permission & Permission.CreateRepository) != 0) permissions.Add("CreateRepository");
+        if ((permission & Permission.DeleteRepository) != 0) permissions.Add("DeleteRepository");
+        if ((permission & Permission.ManageUsers) != 0) permissions.Add("ManageUsers");
+        if ((permission & Permission.ManagePermissions) != 0) permissions.Add("ManagePermissions");
+
+        return permissions.Count > 0 ? string.Join(", ", permissions) : "None";
+    }
 }
